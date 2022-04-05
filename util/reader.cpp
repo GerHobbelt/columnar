@@ -87,7 +87,7 @@ FileReader_c::FileReader_c ( int iFD )
 bool FileReader_c::Open ( const std::string & sName, std::string & sError )
 {
 #ifdef _MSC_VER
-	HANDLE tHandle = CreateFile ( sName.c_str(), GENERIC_READ, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
+	HANDLE tHandle = CreateFileA ( sName.c_str(), GENERIC_READ, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
 	m_iFD = _open_osfhandle ( (intptr_t)tHandle, 0 );
 #else
 	m_iFD = ::open ( sName.c_str(), O_RDONLY | O_BINARY, 0644 );
