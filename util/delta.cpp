@@ -1,4 +1,4 @@
-// Copyright (c) 2021, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2021-2022, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) Daniel Lemire, http://lemire.me/en/
 // All rights reserved
 //
@@ -17,15 +17,18 @@
 
 #include "delta.h"
 
-#if _WIN32
-	#include "intrin.h"
+#if defined(USE_SIMDE)
+	#define SIMDE_ENABLE_NATIVE_ALIASES 1
+	#include <simde/x86/sse4.1.h>
+#elif _MSC_VER
+	#include <intrin.h>
 #else
 	#include <x86intrin.h>
 #endif
 
 #include "deltautil.h"
 
-namespace columnar
+namespace util
 {
 
 template <class T>
@@ -271,4 +274,4 @@ void ComputeInverseDeltas ( std::vector<uint64_t> & dData, bool bAsc )
 	ComputeInverseDeltas ( tSpan, bAsc );
 }
 
-}
+} // namespace util

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2020-2022, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 //
@@ -28,12 +28,13 @@
 	#define fstat		_fstat64
 	#define struct_stat	struct _stat64
 #else
+	#include <sys/mman.h>
 	#include <unistd.h>
 	#define struct_stat        struct stat
 #endif
 
 
-namespace columnar
+namespace util
 {
 
 #ifdef _MSC_VER
@@ -77,14 +78,20 @@ static int PreadWrapper ( int iFD, void * pBuf, size_t tCount, off_t tOff )
 #endif	// _MSC_VER
 
 
-FileReader_c::FileReader_c ( int iFD )
+FileReader_c::FileReader_c ( int iFD, size_t tBufferSize )
 	: m_iFD ( iFD )
+	, m_tSize ( tBufferSize )
 {
 	assert ( iFD>=0 );
 }
 
 
 bool FileReader_c::Open ( const std::string & sName, std::string & sError )
+{
+	return Open ( sName, DEFAULT_SIZE, sError );
+}
+
+bool FileReader_c::Open ( const std::string & sName, int iBufSise, std::string & sError )
 {
 #ifdef _MSC_VER
 	HANDLE tHandle = CreateFileA ( sName.c_str(), GENERIC_READ, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
@@ -101,6 +108,7 @@ bool FileReader_c::Open ( const std::string & sName, std::string & sError )
 
     m_sFile = sName;
 	m_bOpened = true;
+	m_tSize = iBufSise;
 
     return true;
 }
@@ -186,23 +194,185 @@ bool FileReader_c::ReadToBuffer()
 	return true;
 }
 
-
 int64_t FileReader_c::GetFileSize()
 {
-	if ( m_iFD<0 )
-	{
-		m_sError = FormatStr ( "invalid FD: %d", m_iFD );
-		return -1;
-	}
-
-	struct_stat tStat;
-	if ( fstat ( m_iFD, &tStat )<0 )
-	{
-		m_sError = FormatStr ( "fstat failed for %d: '%s'", m_iFD, strerror(errno) );
-		return -1;
-	}
-
-	return tStat.st_size;
+	return util::GetFileSize ( m_iFD, &m_sError );
 }
 
-} // namespace columnar
+
+void ReadVectorPacked ( std::vector<uint64_t> & dData, FileReader_c & tReader )
+{
+	dData.resize ( tReader.Unpack_uint32() );
+	for ( uint64_t & tVal : dData )
+		tVal = tReader.Unpack_uint64();
+}
+
+struct MappedBufferData_t
+{
+#if _WIN32
+	HANDLE		m_iFD { INVALID_HANDLE_VALUE };
+	HANDLE		m_iMap { INVALID_HANDLE_VALUE };
+#else
+	int			m_iFD { -1 };
+#endif
+
+	void * m_pData { nullptr };
+	int64_t m_iBytesCount { 0 };
+};
+
+
+bool MMapOpen ( const std::string & sFile, std::string & sError, MappedBufferData_t & tBuf )
+{
+#if _WIN32
+	assert ( tBuf.m_iFD==INVALID_HANDLE_VALUE );
+#else
+	assert ( tBuf.m_iFD==-1 );
+#endif
+	assert ( !tBuf.m_pData && !tBuf.m_iBytesCount );
+
+#if _WIN32
+	int iAccessMode = GENERIC_READ;
+	DWORD uShare = FILE_SHARE_READ | FILE_SHARE_DELETE;
+
+	HANDLE iFD = CreateFile ( sFile.c_str(), iAccessMode, uShare, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0 );
+	if ( iFD==INVALID_HANDLE_VALUE )
+	{
+		sError = FormatStr ( "failed to open file '%s' (errno %u)", sFile.c_str(), ::GetLastError() );
+		return false;
+	}
+	tBuf.m_iFD = iFD;
+
+	LARGE_INTEGER tLen;
+	if ( GetFileSizeEx ( iFD, &tLen )==0 )
+	{
+		sError = FormatStr ( "failed to fstat file '%s' (errno %u)", sFile.c_str(), ::GetLastError() );
+		return false;
+	}
+
+	tBuf.m_iBytesCount = tLen.QuadPart;
+
+	// mmap fails to map zero-size file
+	if ( tBuf.m_iBytesCount>0 )
+	{
+		tBuf.m_iMap = ::CreateFileMapping ( iFD, NULL, PAGE_READONLY, 0, 0, NULL );
+		tBuf.m_pData = ::MapViewOfFile ( tBuf.m_iMap, FILE_MAP_READ, 0, 0, 0 );
+		if ( !tBuf.m_pData )
+		{
+			sError = FormatStr ( "failed to map file '%s': (errno %u, length=%I64u)", sFile.c_str(), ::GetLastError(), tBuf.m_iBytesCount );
+			return false;
+		}
+	}
+#else
+
+	int iFD = ::open ( sFile.c_str(), O_RDONLY | O_BINARY, 0644 );
+	if ( iFD<0 )
+		return false;
+	tBuf.m_iFD = iFD;
+
+	tBuf.m_iBytesCount = GetFileSize ( iFD, &sError );
+	if ( tBuf.m_iBytesCount<0 )
+		return false;
+
+	// mmap fails to map zero-size file
+	if ( tBuf.m_iBytesCount>0 )
+	{
+		tBuf.m_pData = mmap ( NULL, tBuf.m_iBytesCount, PROT_READ, MAP_SHARED, iFD, 0 );
+		if ( tBuf.m_pData==MAP_FAILED )
+		{
+			sError = FormatStr ( "failed to mmap file '%s': %s (length=%lld)", sFile.c_str(), strerror(errno), tBuf.m_iBytesCount );
+			return false;
+		}
+	}
+#endif
+
+	return true;
+}
+
+void MMapClose ( MappedBufferData_t & tBuf )
+{
+#if _WIN32
+	if ( tBuf.m_pData )
+		::UnmapViewOfFile ( tBuf.m_pData );
+
+	if ( tBuf.m_iMap!=INVALID_HANDLE_VALUE )
+		::CloseHandle ( tBuf.m_iMap );
+	tBuf.m_iMap = INVALID_HANDLE_VALUE;
+
+	if ( tBuf.m_iFD!=INVALID_HANDLE_VALUE )
+		::CloseHandle ( tBuf.m_iFD );
+	tBuf.m_iFD = INVALID_HANDLE_VALUE;
+#else
+	if ( tBuf.m_pData )
+		::munmap ( tBuf.m_pData, tBuf.m_iBytesCount );
+
+	if ( tBuf.m_iFD!=-1 )
+		::close ( tBuf.m_iFD );
+	tBuf.m_iFD = -1;
+#endif
+
+	tBuf.m_pData = nullptr;
+	tBuf.m_iBytesCount = 0;
+}
+
+int64_t GetFileSize ( int iFD, std::string * sError )
+{
+	if ( iFD<0 )
+	{
+		if ( sError )
+			*sError = FormatStr ( "invalid descriptor to fstat '%d'", iFD );
+		return -1;
+	}
+
+	struct_stat st;
+	if ( fstat ( iFD, &st )<0 )
+	{
+		if ( sError )
+			*sError = FormatStr ( "failed to fstat file '%d': '%s'", iFD, strerror(errno) );
+		return -1;
+	}
+
+	return st.st_size;
+}
+
+class MappedBuffer_c : public MappedBuffer_i
+{
+public:
+	MappedBuffer_c() = default;
+	virtual ~MappedBuffer_c() override = default;
+
+	bool Open ( const std::string & sFile, std::string & sError ) override
+	{
+		m_sFileName = sFile;
+		return MMapOpen ( sFile, sError, m_tBuf );
+	}
+
+	void Close () override
+	{
+		MMapClose ( m_tBuf );
+	}
+	
+	void * GetPtr () const override
+	{
+		return m_tBuf.m_pData;
+	}
+
+	size_t GetLengthBytes () const override
+	{
+		return m_tBuf.m_iBytesCount;
+	}
+
+	const char * GetFileName() const override
+	{
+		return m_sFileName.c_str();
+	}
+
+	MappedBufferData_t m_tBuf;
+	std::string m_sFileName;
+};
+
+MappedBuffer_i * MappedBuffer_i::Create()
+{
+	return new MappedBuffer_c();
+}
+
+} // namespace util

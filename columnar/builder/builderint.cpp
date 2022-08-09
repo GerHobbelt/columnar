@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2020-2022, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 //
@@ -23,6 +23,9 @@
 
 namespace columnar
 {
+
+using namespace util;
+using namespace common;
 
 template <typename T>
 class AttributeHeaderBuilder_Int_T : public AttributeHeaderBuilder_c
@@ -449,7 +452,6 @@ public:
 	void	AddDoc ( const uint8_t * pData, int iLength ) override;
 
 private:
-	static const uint64_t STR_HASH_SEED = 0xCBF29CE484222325ULL;
 	StringHash_fn m_fnCalcHash = nullptr;
 };
 

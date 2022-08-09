@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2020-2022, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 //
@@ -27,6 +27,9 @@
 
 namespace columnar
 {
+
+using namespace util;
+using namespace common;
 
 template <typename T>
 class StoredBlock_Int_Const_T
@@ -399,6 +402,8 @@ public:
 	int			Get ( const uint8_t * & pData ) final	{ assert ( 0 && "INTERNAL ERROR: requesting blob from int iterator" ); return 0; }
 	uint8_t *	GetPacked() final						{ assert ( 0 && "INTERNAL ERROR: requesting blob from int iterator" ); return nullptr; }
 	int			GetLength() final						{ assert ( 0 && "INTERNAL ERROR: requesting blob length from int iterator" ); return 0; }
+
+	void		AddDesc ( std::vector<IteratorDesc_t> & dDesc ) const override { dDesc.push_back ( { BASE::m_tHeader.GetName(), "iterator" } ); };
 
 private:
 	FORCE_INLINE uint32_t	DoAdvance ( uint32_t tRowID );
@@ -864,6 +869,7 @@ public:
 					Analyzer_INT_T ( const AttributeHeader_i & tHeader, FileReader_c * pReader, const Filter_t & tSettings );
 
 	bool			GetNextRowIdBlock ( Span_T<uint32_t> & dRowIdBlock ) final;
+	void			AddDesc ( std::vector<IteratorDesc_t> & dDesc ) const final { dDesc.push_back ( { ACCESSOR::m_tHeader.GetName(), "analyzer" } ); }
 
 private:
 	AnalyzerBlock_Int_Const_c	m_tBlockConst;
@@ -882,7 +888,6 @@ private:
 	void				SetupPackingFuncs_Range();
 
 	void				SetupPackingFuncs();
-	void				FixupFilterSettings();
 
 	int					ProcessSubblockConst ( uint32_t * & pRowID, int iSubblockIdInBlock );
 
@@ -910,7 +915,7 @@ Analyzer_INT_T<VALUES,ACCESSOR_VALUES,RANGE_EVAL>::Analyzer_INT_T ( const Attrib
 	, m_tBlockValues (m_tRowID )
 	, m_tSettings ( tSettings )
 {
-	FixupFilterSettings();
+	FixupFilterSettings (m_tSettings, ACCESSOR::m_tHeader.GetType() );
 
 	assert ( !tSettings.m_bExclude || ( tSettings.m_bExclude && tSettings.m_eType==FilterType_e::VALUES ) );
 
@@ -1019,28 +1024,6 @@ void Analyzer_INT_T<VALUES,ACCESSOR_VALUES,RANGE_EVAL>::SetupPackingFuncs()
 }
 
 template<typename VALUES, typename ACCESSOR_VALUES, typename RANGE_EVAL>
-void Analyzer_INT_T<VALUES,ACCESSOR_VALUES,RANGE_EVAL>::FixupFilterSettings()
-{
-	if ( ACCESSOR::m_tHeader.GetType()!=AttrType_e::FLOAT )
-		return;
-
-	// this is basically the same stuff we do when we create filters, but we don't have access to previously modified filter settings
-	// that's why we need to do it all over again
-	if ( m_tSettings.m_eType==FilterType_e::VALUES && m_tSettings.m_dValues.size()==1 )
-	{
-		m_tSettings.m_eType = FilterType_e::FLOATRANGE;
-		m_tSettings.m_fMinValue = m_tSettings.m_fMaxValue = (float)m_tSettings.m_dValues[0];
-	}
-
-	if ( m_tSettings.m_eType==FilterType_e::RANGE )
-	{
-		m_tSettings.m_eType = FilterType_e::FLOATRANGE;
-		m_tSettings.m_fMinValue = (float)m_tSettings.m_iMinValue;
-		m_tSettings.m_fMaxValue = (float)m_tSettings.m_iMaxValue;
-	}
-}
-
-template<typename VALUES, typename ACCESSOR_VALUES, typename RANGE_EVAL>
 int Analyzer_INT_T<VALUES,ACCESSOR_VALUES,RANGE_EVAL>::ProcessSubblockConst ( uint32_t * & pRowID, int iSubblockIdInBlock )
 {
 	return m_tBlockConst.ProcessSubblock ( pRowID, StoredBlockTraits_t::GetNumSubblockValues(iSubblockIdInBlock) );
@@ -1136,8 +1119,6 @@ bool Analyzer_INT_T<VALUES,ACCESSOR_VALUES,RANGE_EVAL>::GetNextRowIdBlock ( Span
 template<typename VALUES, typename ACCESSOR_VALUES, typename RANGE_EVAL>
 bool Analyzer_INT_T<VALUES,ACCESSOR_VALUES,RANGE_EVAL>::MoveToBlock ( int iNextBlock )
 {
-	int iNumMatchingSubblocks = m_pMatchingSubblocks->GetNumBlocks();
-
 	while(true)
 	{
 		m_iCurBlockId = iNextBlock;
@@ -1157,10 +1138,7 @@ bool Analyzer_INT_T<VALUES,ACCESSOR_VALUES,RANGE_EVAL>::MoveToBlock ( int iNextB
 				break;
 		}
 
-		while ( iNextBlock==m_iCurBlockId && m_iCurSubblock<iNumMatchingSubblocks )
-			iNextBlock = ACCESSOR::SubblockId2BlockId ( m_pMatchingSubblocks->GetBlock(m_iCurSubblock++) );
-
-		if ( m_iCurSubblock>=iNumMatchingSubblocks )
+		if ( !ANALYZER::RewindToNextBlock ( (ACCESSOR&)*this, iNextBlock ) )
 			return false;
 	}
 
@@ -1206,6 +1184,9 @@ static Analyzer_i * CreateAnalyzerInt ( const AttributeHeader_i & tHeader, FileR
 
 	case AttrType_e::INT64:
 		return ::new Analyzer_INT_T<int64_t, uint64_t, RANGE_EVAL> ( tHeader, pReader, tSettings );
+
+	case AttrType_e::UINT64:
+		return ::new Analyzer_INT_T<uint64_t, uint64_t, RANGE_EVAL> ( tHeader, pReader, tSettings );
 
 	case AttrType_e::FLOAT:
 		return ::new Analyzer_INT_T<float, uint32_t, RANGE_EVAL> ( tHeader, pReader, tSettings );

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2020-2022, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 //
@@ -25,8 +25,9 @@
 #include <type_traits>
 #include <fcntl.h>
 #include <climits>
+#include <assert.h>
 
-namespace columnar
+namespace util
 {
 
 #ifdef _MSC_VER
@@ -56,6 +57,7 @@ namespace columnar
 	#endif
 #endif
 
+const uint64_t STR_HASH_SEED = 0xCBF29CE484222325ULL;
 
 template<typename T>
 class Span_T
@@ -80,8 +82,17 @@ public:
 	T *     end() const     { return m_pData+m_tLength; }
 	size_t  size() const    { return m_tLength; }
 	bool    empty() const   { return m_tLength==0; }
-	T & operator [] ( size_t i ) { return m_pData[i]; }
-	const T & operator [] ( size_t i ) const { return m_pData[i]; }
+	T & operator [] ( size_t i )
+	{
+		assert ( i < m_tLength );
+		return m_pData[i];
+	}
+
+	const T & operator [] ( size_t i ) const
+	{
+		assert ( i < m_tLength );
+		return m_pData[i];
+	}
 
 protected:
 	T *		m_pData = nullptr;
@@ -218,8 +229,9 @@ private:
 class FileWriter_c
 {
 public:
-				~FileWriter_c() { Close(); }
+				~FileWriter_c();
 
+	bool        Open ( const std::string & sFile, bool bNewFile, bool bAppend, bool bTmp, std::string & sError );
 	bool        Open ( const std::string & sFile, std::string & sError );
 	void        Close();
 	void        Unlink();
@@ -227,6 +239,7 @@ public:
 
 	void        Write ( const uint8_t * pData, size_t tLength );
 	void        SeekAndWrite ( int64_t iOffset, uint64_t uValue );
+	void        Seek ( int64_t iOffset );
 	void        Write_string ( const std::string & sStr );
 	void        Write_uint8 ( uint8_t uValue )      { Write ( (uint8_t*)&uValue, sizeof(uValue) ); }
 	void        Write_uint16 ( uint16_t uValue )    { Write ( (uint8_t*)&uValue, sizeof(uValue) ); }
@@ -254,6 +267,7 @@ private:
 	int64_t     m_iFilePos = 0;
 
 	bool        m_bError = false;
+	bool		m_bTemporary = false; // whatever to unlink file at writer destructor
 	std::string m_sError;
 
 	void        Flush();
@@ -343,6 +357,19 @@ const T * binary_search ( const CONTAINER & dValues, const T & tValue )
 	return &(*tFound);
 }
 
+template<typename VEC, typename T>
+int binary_search_idx ( const VEC & dValues, const T & tValue )
+{
+	auto tFirst = dValues.begin();
+	auto tLast = dValues.end();
+	auto tFound = std::lower_bound ( tFirst, tLast, tValue );
+
+	if ( tFound!=tLast && tValue==*tFound )
+		return tFound-tFirst;
+
+	return -1;
+}
+
 template <typename T>
 constexpr auto to_underlying(T t) noexcept
 {
@@ -364,4 +391,139 @@ inline float to_type<float> ( int64_t iValue )
 int     CalcNumBits ( uint64_t uNumber );
 bool    CopySingleFile ( const std::string & sSource, const std::string & sDest, std::string & sError, int iMode );
 
-} // namespace columnar
+template<typename VEC>
+void VectorReset ( VEC & dData )
+{
+	dData.clear();
+	dData.shrink_to_fit();
+}
+
+template<typename VEC, typename WRITER>
+void WriteVector ( const VEC & dData, WRITER & tWriter )
+{
+	tWriter.Write ( (const uint8_t *)dData.data(), sizeof ( dData[0] ) * dData.size() );
+}
+
+template<typename VEC, typename WRITER>
+void WriteVectorLen ( const VEC & dData, WRITER & tWriter )
+{
+	tWriter.Pack_uint64 ( dData.size() );
+	tWriter.Write ( (const uint8_t *)dData.data(), sizeof ( dData[0] ) * dData.size() );
+}
+
+template<typename VEC, typename WRITER>
+void WriteVectorLen32 ( const VEC & dData, WRITER & tWriter )
+{
+	tWriter.Pack_uint32 ( (uint32_t)dData.size() );
+	tWriter.Write ( (const uint8_t *)dData.data(), sizeof ( dData[0] ) * dData.size() );
+}
+
+template<typename VEC, typename WRITER>
+void WriteVectorRawLen32 ( const VEC & dData, WRITER & tWriter )
+{
+	tWriter.Write_uint32 ( (uint32_t)dData.size() );
+	tWriter.Write ( (const uint8_t *)dData.data(), sizeof ( dData[0] ) * dData.size() );
+}
+
+template<typename WRITER>
+void WriteVectorPacked ( const std::vector<uint64_t> & dData, WRITER & tWriter )
+{
+	tWriter.Pack_uint32 ( (uint32_t)dData.size() );
+	for ( uint64_t tVal : dData )
+		tWriter.Pack_uint64 ( tVal );
+}
+
+bool FloatEqual ( float fA, float fB );
+
+template <typename T>
+constexpr int Log2 ( T tValue )
+{
+	int iBits = 0;
+	while ( tValue )
+	{
+		tValue >>= 1;
+		iBits++;
+	}
+
+	return iBits;
+}
+
+template <typename T=uint32_t>
+class BitVec_T
+{
+public:
+	explicit BitVec_T ( int iSize ) { Resize(iSize); }
+
+	inline bool BitGet ( int iBit )
+	{
+		if ( !m_dData.size() )
+			return false;
+
+		assert ( iBit>=0 && iBit<m_iSize );
+		return ( ( m_dData [ iBit>>SHIFT ] & ( ( (T)1 )<<( iBit&MASK ) ) )!=0 );
+	}
+
+	inline void BitSet ( int iBit )
+	{
+		if ( !m_dData.size() )
+			return;
+
+		assert ( iBit>=0 && iBit<m_iSize );
+		m_dData [ iBit>>SHIFT ] |= ( ( (T)1 )<<( iBit&MASK ) );
+	}
+
+	int Scan ( int iStart )
+	{
+		assert ( iStart<m_iSize );
+
+		const T * pData = &m_dData.front();
+		int iIndex = iStart>>SHIFT;
+		T uMask = ~( ( T(1)<<( iStart&MASK ) )-1 );
+		if ( pData[iIndex] & uMask )
+			return (iIndex<<SHIFT) + ScanBit ( pData[iIndex], iStart&MASK );
+
+		iIndex++;
+		while ( iIndex<(int)m_dData.size() && !pData[iIndex] )
+			iIndex++;
+
+		if ( iIndex>=(int)m_dData.size() )
+			return m_iSize;
+
+		return (iIndex<<SHIFT) + ScanBit ( pData[iIndex], 0 );
+	}
+
+	void SetAllBits() { std::fill ( m_dData.begin(), m_dData.end(), (T)0xffffffffffffffffULL ); }
+	void Resize ( int iSize )
+	{
+		m_iSize = iSize;
+		if ( iSize )
+		{
+			int iCount = ( iSize+SIZEBITS-1 )/SIZEBITS;
+			m_dData = std::vector<T> ( iCount, 0 );
+		}
+	}
+
+	int	GetLength() const { return m_iSize; }
+	const std::vector<T> & GetData() const { return m_dData; }
+
+private:
+	static const size_t	SIZEBITS = sizeof(T)*8;
+	static const T		MASK = T(sizeof(T)*8 - 1);
+	static constexpr T	SHIFT = T(Log2(SIZEBITS)-1);
+
+	std::vector<T>	m_dData;
+	int				m_iSize = 0;
+
+	inline int ScanBit ( T tData, int iStart )
+	{
+		for ( int i = iStart; i < SIZEBITS; i++ )
+			if ( tData & ( (T)1<<i ) )
+				return i;
+
+		return -1;
+	}
+};
+
+using BitVec_c = BitVec_T<>;
+
+} // namespace util

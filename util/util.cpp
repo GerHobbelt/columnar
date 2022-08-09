@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2020-2022, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 //
@@ -16,8 +16,9 @@
 
 #include "util.h"
 #include <stdexcept>
-#include <assert.h>
 #include <errno.h>
+#include <cmath>
+#include <limits>
 
 #ifdef _MSC_VER
 	#include <io.h>
@@ -25,7 +26,7 @@
 	#include <unistd.h>
 #endif
 
-namespace columnar
+namespace util
 {
 
 int CalcNumBits ( uint64_t uNumber )
@@ -126,6 +127,35 @@ static void Seek ( int iFD, int64_t iOffset )
 
 /////////////////////////////////////////////////////////////////////
 
+bool FileWriter_c::Open ( const std::string & sFile, bool bNewFile, bool bAppend, bool bTmp, std::string & sError )
+{
+	assert ( m_iFD<0 );
+	assert ( !m_pData );
+
+	int iFlags = O_CREAT | O_RDWR | O_BINARY;
+	if ( bAppend )
+		iFlags |= O_APPEND;
+	if ( bNewFile )
+		iFlags |= O_TRUNC;
+
+	m_sFile = sFile;
+	m_pData = std::unique_ptr<uint8_t[]> ( new uint8_t[m_tSize] );
+	m_iFD = ::open ( sFile.c_str(), iFlags, 0644 );
+	if ( m_iFD<0 )
+	{
+		sError = FormatStr ( "error creating '%s': %s", sFile.c_str(), strerror(errno) );
+		return false;
+	}
+
+	m_tUsed = 0;
+	m_iFilePos = 0;
+	m_bError = false;
+	m_sError = "";
+	m_bTemporary = bTmp;
+
+	return true;
+}
+
 bool FileWriter_c::Open ( const std::string & sFile, std::string & sError )
 {
 	assert ( m_iFD<0 );
@@ -191,7 +221,7 @@ void FileWriter_c::SeekAndWrite ( int64_t iOffset, uint64_t uValue )
 
 	Flush();
 
-	Seek ( m_iFD, iOffset );
+	Seek ( iOffset );
 	int iRes = ::write ( m_iFD, &uValue, sizeof(uValue) );
 	if ( iRes<0 )
 	{
@@ -199,9 +229,15 @@ void FileWriter_c::SeekAndWrite ( int64_t iOffset, uint64_t uValue )
 		m_bError = true;
 	}
 
-	Seek ( m_iFD, iOldPos );
+	Seek ( iOldPos );
 }
 
+void FileWriter_c::Seek ( int64_t iOffset )
+{
+	Flush();
+	util::Seek ( m_iFD, iOffset );
+	m_iFilePos = iOffset;
+}
 
 void FileWriter_c::Write_string ( const std::string & sStr )
 {
@@ -226,6 +262,14 @@ void FileWriter_c::Flush()
 	m_tUsed = 0;
 }
 
+FileWriter_c::~FileWriter_c()
+{
+	if ( m_bTemporary )
+		Unlink();
+
+	Close();
+}
+
 /////////////////////////////////////////////////////////////////////
 
 MemWriter_c::MemWriter_c ( std::vector<uint8_t> & dData )
@@ -243,4 +287,9 @@ void MemWriter_c::Write ( const uint8_t * pData, size_t tSize )
 	memcpy ( &m_dData[tOldSize], pData, tSize );
 }
 
-} // namespace columnar
+bool FloatEqual ( float fA, float fB )
+{
+    return std::fabs ( fA - fB )<=std::numeric_limits<float>::epsilon();
+}
+
+} // namespace util
