@@ -48,6 +48,7 @@ bool AttributeHeaderBuilder_Bool_c::Save ( FileWriter_c & tWriter, int64_t & tBa
 	if ( !BASE::Save ( tWriter, tBaseOffset, sError ) )
 		return false;
 
+	tWriter.Write_uint8(1); // minmax presence flag
 	return m_tMinMax.Save ( tWriter, sError );
 }
 
@@ -171,9 +172,9 @@ void Packer_Bool_c::Flush()
 	if ( m_dCollected.empty() )
 		return;
 
-	m_tHeader.AddBlock ( m_tWriter.GetPos() );
-
-	WriteToFile ( ChoosePacking() );
+	auto ePacking = ChoosePacking();
+	m_tHeader.AddBlock ( m_tWriter.GetPos(), to_underlying(ePacking) );
+	WriteToFile(ePacking);
 
 	m_dCollected.resize(0);
 	m_bFirst = true;
