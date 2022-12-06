@@ -20,6 +20,7 @@
 #include "delta.h"
 #include "codec.h"
 #include "blockreader.h"
+#include "bitvec.h"
 
 #include <unordered_map>
 
@@ -67,7 +68,7 @@ class SecondaryIndex_c : public Index_i
 public:
 	bool		Setup ( const std::string & sFile, std::string & sError );
 
-	bool		CreateIterators ( std::vector<BlockIterator_i *> & dIterators, const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize, std::string & sError ) const override;
+	bool		CreateIterators ( std::vector<BlockIterator_i *> & dIterators, const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize, int iCutoff, std::string & sError ) const override;
 	uint32_t	GetNumIterators ( const common::Filter_t & tFilter ) const override;
 	bool		IsEnabled ( const std::string & sName ) const override;
 	int64_t		GetCountDistinct ( const std::string & sName ) const override;
@@ -93,8 +94,8 @@ private:
 
 	std::string m_sFileName;
 
-	int64_t		GetValsRows ( std::vector<BlockIterator_i *> * pIterators, const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize ) const;
-	int64_t		GetRangeRows ( std::vector<BlockIterator_i *> * pIterators, const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize ) const;
+	int64_t		GetValsRows ( std::vector<BlockIterator_i *> * pIterators, const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize, int iCutoff ) const;
+	int64_t		GetRangeRows ( std::vector<BlockIterator_i *> * pIterators, const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize, int iCutof ) const;
 	int			GetColumnId ( const std::string & sName ) const;
 	const ColumnInfo_t * GetAttr ( const Filter_t & tFilter, std::string & sError ) const;
 };
@@ -260,7 +261,7 @@ void SecondaryIndex_c::ColumnUpdated ( const char * sName )
 }
 
 
-int64_t SecondaryIndex_c::GetValsRows ( std::vector<BlockIterator_i *> * pIterators,  const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize ) const
+int64_t SecondaryIndex_c::GetValsRows ( std::vector<BlockIterator_i *> * pIterators,  const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize, int iCutoff ) const
 {
 	int iCol = GetColumnId ( tFilter.m_sName );
 	assert ( iCol>=0 );
@@ -288,14 +289,14 @@ int64_t SecondaryIndex_c::GetValsRows ( std::vector<BlockIterator_i *> * pIterat
 	std::sort ( dBlocksIt.begin(), dBlocksIt.end(), [] ( const BlockIter_t & tA, const BlockIter_t & tB ) { return tA.m_iStart<tB.m_iStart; } );
 	RsetInfo_t tRsetInfo { iNumIterators, uMaxValues, iRsetSize };
 
-	std::unique_ptr<BlockReader_i> pBlockReader { CreateBlockReader ( m_tReader.GetFD(), tCol, m_tSettings, uBlockBaseOff, pBounds, tRsetInfo ) } ;
+	std::unique_ptr<BlockReader_i> pBlockReader { CreateBlockReader ( m_tReader.GetFD(), tCol, m_tSettings, uBlockBaseOff, pBounds, tRsetInfo, iCutoff ) } ;
 	pBlockReader->CreateBlocksIterator ( dBlocksIt, *pIterators );
 
 	return iNumIterators;
 }
 
 
-int64_t SecondaryIndex_c::GetRangeRows ( std::vector<BlockIterator_i *> * pIterators,  const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize ) const
+int64_t SecondaryIndex_c::GetRangeRows ( std::vector<BlockIterator_i *> * pIterators,  const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize, int iCutoff ) const
 {
 	int iCol = GetColumnId ( tFilter.m_sName );
 	assert ( iCol>=0 );
@@ -307,18 +308,21 @@ int64_t SecondaryIndex_c::GetRangeRows ( std::vector<BlockIterator_i *> * pItera
 
 	const bool bFloat = ( tCol.m_eType==AttrType_e::FLOAT );
 
+	int64_t iNumIterators = 0;
 	ApproxPos_t tPos { 0, 0, ( uBlocksCount - 1 ) * m_iValuesPerBlock };
 	if ( tFilter.m_bRightUnbounded )
 	{
 		ApproxPos_t tFound =  ( bFloat ? m_dIdx[iCol]->Search ( FloatToUint ( tFilter.m_fMinValue ) ) : m_dIdx[iCol]->Search ( tFilter.m_iMinValue ) );
 		tPos.m_iPos = tFound.m_iPos;
 		tPos.m_iLo = tFound.m_iLo;
+		iNumIterators = tPos.m_iHi-tPos.m_iPos;
 	}
 	else if ( tFilter.m_bLeftUnbounded )
 	{
 		ApproxPos_t tFound = ( bFloat ? m_dIdx[iCol]->Search ( FloatToUint ( tFilter.m_fMaxValue ) ) : m_dIdx[iCol]->Search ( tFilter.m_iMaxValue ) );
 		tPos.m_iPos = tFound.m_iPos;
 		tPos.m_iHi = tFound.m_iHi;
+		iNumIterators = tPos.m_iPos-tPos.m_iLo;
 	}
 	else
 	{
@@ -327,16 +331,18 @@ int64_t SecondaryIndex_c::GetRangeRows ( std::vector<BlockIterator_i *> * pItera
 		tPos.m_iLo = std::min ( tFoundMin.m_iLo, tFoundMax.m_iLo );
 		tPos.m_iPos = std::min ( tFoundMin.m_iPos, tFoundMax.m_iPos );
 		tPos.m_iHi = std::max ( tFoundMin.m_iHi, tFoundMax.m_iHi );
+		iNumIterators = tFoundMax.m_iPos-tFoundMin.m_iPos+1;
 	}
 
-	int64_t iNumIterators = tPos.m_iHi-tPos.m_iLo;
+	iNumIterators = std::max ( iNumIterators, int64_t(0) );
+
 	if ( !pIterators )
 		return iNumIterators;
 
 	BlockIter_t tPosIt ( tPos, 0, uBlocksCount, m_iValuesPerBlock );
 	RsetInfo_t tRsetInfo { iNumIterators, uMaxValues, iRsetSize };
 
-	std::unique_ptr<BlockReader_i> pReader { CreateRangeReader ( m_tReader.GetFD(), tCol, m_tSettings, uBlockBaseOff, pBounds, tRsetInfo ) };
+	std::unique_ptr<BlockReader_i> pReader { CreateRangeReader ( m_tReader.GetFD(), tCol, m_tSettings, uBlockBaseOff, pBounds, tRsetInfo, iCutoff ) };
 	pReader->CreateBlocksIterator ( tPosIt, tFilter, *pIterators );
 	return iNumIterators;
 }
@@ -374,7 +380,7 @@ Filter_t FixupFilter ( const Filter_t & tFilter, const ColumnInfo_t & tCol )
 }
 
 
-bool SecondaryIndex_c::CreateIterators ( std::vector<BlockIterator_i *> & dIterators, const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize, std::string & sError ) const
+bool SecondaryIndex_c::CreateIterators ( std::vector<BlockIterator_i *> & dIterators, const Filter_t & tFilter, const RowidRange_t * pBounds, uint32_t uMaxValues, int64_t iRsetSize, int iCutoff, std::string & sError ) const
 {
 	const auto * pCol = GetAttr ( tFilter, sError );
 	if ( !pCol )
@@ -384,12 +390,12 @@ bool SecondaryIndex_c::CreateIterators ( std::vector<BlockIterator_i *> & dItera
 	switch ( tFixedFilter.m_eType )
 	{
 	case FilterType_e::VALUES:
-		GetValsRows ( &dIterators, tFixedFilter, pBounds, uMaxValues, iRsetSize );
+		GetValsRows ( &dIterators, tFixedFilter, pBounds, uMaxValues, iRsetSize, iCutoff );
 		return true;
 
 	case FilterType_e::RANGE:
 	case FilterType_e::FLOATRANGE:
-		GetRangeRows ( &dIterators, tFixedFilter, pBounds, uMaxValues, iRsetSize );
+		GetRangeRows ( &dIterators, tFixedFilter, pBounds, uMaxValues, iRsetSize, iCutoff );
 		return true;
 
 	default:
@@ -410,11 +416,11 @@ uint32_t SecondaryIndex_c::GetNumIterators ( const common::Filter_t & tFilter ) 
 	switch ( tFixedFilter.m_eType )
 	{
 	case FilterType_e::VALUES:
-		return GetValsRows ( nullptr, tFixedFilter, nullptr, 0, 0 );
+		return GetValsRows ( nullptr, tFixedFilter, nullptr, 0, 0, INT_MAX );
 
 	case FilterType_e::RANGE:
 	case FilterType_e::FLOATRANGE:
-		return GetRangeRows ( nullptr, tFixedFilter, nullptr, 0, 0 );
+		return GetRangeRows ( nullptr, tFixedFilter, nullptr, 0, 0, INT_MAX );
 
 	default:
 		return 0;
