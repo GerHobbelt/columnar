@@ -230,7 +230,7 @@ public:
 	bool			WasCutoffHit() const final		{ return false; }
 
 private:
-	static const int MAX_COLLECTED = 128;
+	static const int MAX_COLLECTED = 1024;
 
 	std::shared_ptr<MatchingBlocks_c>	m_pMatchingBlocks;
 	std::array<uint32_t,MAX_COLLECTED>	m_dCollected;
@@ -250,9 +250,10 @@ private:
 	int			m_iMinMaxLeafShift = 0;
 	int			m_iNumLevels = 0;
 
-	inline bool	SetCurBlock ( int iBlock );
-	FORCE_INLINE int GetNumDocs ( int iBlock ) const;
-	FORCE_INLINE uint32_t MinMaxBlockId2RowId ( int iBlockId ) const;
+	FORCE_INLINE bool		SetCurBlock ( int iBlock );
+	FORCE_INLINE int		GetNumDocs ( int iBlock ) const;
+	FORCE_INLINE uint32_t	MinMaxBlockId2RowId ( int iBlockId ) const		{ return iBlockId<<m_iMinMaxLeafShift; }
+	FORCE_INLINE int		RowId2MinMaxBlockId ( uint32_t uRowID ) const	{ return uRowID>>m_iMinMaxLeafShift; }
 };
 
 
@@ -284,35 +285,24 @@ bool BlockIterator_c::Setup ( const std::vector<HeaderWithLocator_t> & dHeaders,
 	return true;
 }
 
+
 void BlockIterator_c::AddDesc ( std::vector<IteratorDesc_t> & dDesc ) const
 {
 	for ( const auto & i : m_dAttrs )
 		dDesc.push_back ( { i, "prefilter" } );
 }
 
+
 bool BlockIterator_c::HintRowID ( uint32_t tRowID )
 {
-	int iNextBlock = m_iBlock;
-	int iNumBlocks = m_pMatchingBlocks->GetNumBlocks();
+	int iNextBlock = m_pMatchingBlocks->Find ( m_iBlock, RowId2MinMaxBlockId(tRowID) );
+	if ( iNextBlock>=m_pMatchingBlocks->GetNumBlocks() )
+		return false;
 
-	// we assume that we are only advancing forward
-	while ( iNextBlock<iNumBlocks )
-	{
-		uint32_t tSubblockStart = MinMaxBlockId2RowId ( m_pMatchingBlocks->GetBlock(iNextBlock) );
-		uint32_t tSubblockEnd = tSubblockStart + m_iDocsPerBlock;
+	if ( iNextBlock>m_iBlock )
+		SetCurBlock(iNextBlock);
 
-		if ( tRowID<tSubblockStart || ( tRowID>=tSubblockStart && tRowID<tSubblockEnd ) )
-		{
-			if ( iNextBlock!=m_iBlock )
-				SetCurBlock(iNextBlock);
-
-			return true;
-		}
-
-		iNextBlock++;
-	}
-
-	return false;
+	return true;
 }
 
 
@@ -375,12 +365,6 @@ int BlockIterator_c::GetNumDocs ( int iBlock ) const
 		return m_iDocsPerBlock;
 
 	return m_iDocsInLastBlock;
-}
-
-
-uint32_t BlockIterator_c::MinMaxBlockId2RowId ( int iBlockId ) const
-{
-	return iBlockId<<m_iMinMaxLeafShift;
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -515,13 +499,18 @@ Analyzer_i * Columnar_c::CreateAnalyzer ( const Filter_t & tSettings, bool bHave
 	if ( !pReader )
 		return nullptr;
 
-	switch ( pHeader->GetType() )
+	auto eType = pHeader->GetType();
+	switch ( eType )
 	{
 	case AttrType_e::UINT32:
 	case AttrType_e::TIMESTAMP:
 	case AttrType_e::FLOAT:
 	case AttrType_e::INT64:
-		return CreateAnalyzerInt ( *pHeader, pReader.release(), tSettings, bHaveMatchingBlocks );
+	{
+		Filter_t tFixedSettings = tSettings;
+		FixupFilterSettings ( tFixedSettings, eType );
+		return CreateAnalyzerInt ( *pHeader, pReader.release(), tFixedSettings, bHaveMatchingBlocks );
+	}
 
 	case AttrType_e::BOOLEAN:
 		return CreateAnalyzerBool ( *pHeader, pReader.release(), tSettings, bHaveMatchingBlocks );
