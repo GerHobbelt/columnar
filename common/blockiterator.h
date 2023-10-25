@@ -14,9 +14,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// This file is a part of the common headers (API).
+// If you make any significant changes to this file, you MUST bump the LIB_VERSION in columnar.h or secondary.h
+
 #pragma once
 
-#include "util/util_private.h"
+#include "util/util.h"
 
 namespace common
 {
