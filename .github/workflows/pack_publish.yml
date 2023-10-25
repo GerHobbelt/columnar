@@ -1,5 +1,6 @@
 name: 📦 Pack and publish
 
+#on: workflow_call
 on:
   workflow_run:
     workflows: [ 🔬 Test ]
