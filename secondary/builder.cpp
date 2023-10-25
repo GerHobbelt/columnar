@@ -16,6 +16,7 @@
 
 #include "builder.h"
 #include "secondary.h"
+#include "blockreader.h"
 #include "codec.h"
 #include "delta.h"
 #include "pgm.h"
@@ -42,6 +43,7 @@ namespace SI
 #define VALUES_PER_BLOCK 128
 #define ROWIDS_PER_BLOCK 1024
 
+/////////////////////////////////////////////////////////////////////
 
 class SIWriter_i
 {
@@ -180,9 +182,7 @@ static void EncodeRowsBlock ( VEC & dSrcRows, uint32_t iOff, uint32_t iCount, In
 		dRows = Span_T<uint32_t> ( dSrcRows.data(), iCount );
 	}
 
-	dBufRows.resize(0);
-	ComputeDeltas ( dRows.data(), (int)dRows.size(), true );
-	pCodec->Encode ( dRows, dBufRows );
+	pCodec->EncodeDelta ( dRows, dBufRows );
 
 	if ( bWriteSize )
 		WriteVectorLen32 ( dBufRows, tWriter );
@@ -190,14 +190,11 @@ static void EncodeRowsBlock ( VEC & dSrcRows, uint32_t iOff, uint32_t iCount, In
 		WriteVector ( dBufRows, tWriter );
 }
 
-template<typename VEC, typename WRITER>
-void EncodeBlock ( VEC & dSrc, IntCodec_i * pCodec, std::vector<uint32_t> & dBuf, WRITER & tWriter )
+template<typename T, typename WRITER>
+void EncodeBlock ( std::vector<T> & dSrc, IntCodec_i * pCodec, std::vector<uint32_t> & dBuf, WRITER & tWriter )
 {
-	dBuf.resize ( 0 );
-
-	ComputeDeltas ( dSrc.data(), (int)dSrc.size(), true );
-	pCodec->Encode ( dSrc, dBuf );
-
+	Span_T<T> tSpan (dSrc);
+	pCodec->EncodeDelta ( tSpan, dBuf );
 	WriteVectorLen32 ( dBuf, tWriter );
 }
 
@@ -851,6 +848,7 @@ bool Builder_c::WriteMeta ( const std::string & sPgmName, const std::string & sB
 		Settings_t tSettings;
 		tSettings.Save(tDstFile);
 		tDstFile.Write_uint32 ( VALUES_PER_BLOCK );
+		tDstFile.Write_uint32 ( ROWIDS_PER_BLOCK );
 		
 		// write schema
 		for ( const auto & i : m_dAttrs )
@@ -1021,9 +1019,10 @@ RawValue_T<uint64_t> Convert ( const BinValue_T<uint64_t> & tSrc )
 } // namespace SI
 
 
-SI::Builder_i * CreateBuilder ( const SI::Settings_t & tSettings, const Schema_t & tSchema, int iMemoryLimit, const std::string & sFile, std::string & sError )
+SI::Builder_i * CreateBuilder ( const Schema_t & tSchema, int iMemoryLimit, const std::string & sFile, std::string & sError )
 {
 	std::unique_ptr<SI::Builder_c> pBuilder ( new SI::Builder_c );
+	SI::Settings_t tSettings;
 	if ( !pBuilder->Setup ( tSettings, tSchema, iMemoryLimit, sFile, sError ) )
 		return nullptr;
 

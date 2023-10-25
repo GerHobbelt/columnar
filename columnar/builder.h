@@ -25,7 +25,7 @@
 namespace columnar
 {
 
-static const uint32_t STORAGE_VERSION = 10;
+static const uint32_t STORAGE_VERSION = 11;
 
 class Builder_i
 {
@@ -42,5 +42,5 @@ public:
 
 extern "C"
 {
-	DLLEXPORT columnar::Builder_i * CreateColumnarBuilder ( const columnar::Settings_t & tSettings, const common::Schema_t & tSchema, const std::string & sFile, std::string & sError );
+	DLLEXPORT columnar::Builder_i * CreateColumnarBuilder ( const common::Schema_t & tSchema, const std::string & sFile, std::string & sError );
 }

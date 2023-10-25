@@ -28,6 +28,18 @@ namespace columnar
 static const uint32_t	BLOCK_ID_BITS = 16;
 static const int		DOCS_PER_BLOCK = 1 << BLOCK_ID_BITS;
 
+struct Settings_t
+{
+	int			m_iSubblockSize = 1024;
+	std::string	m_sCompressionUINT32 = "libstreamvbyte";
+	std::string	m_sCompressionUINT64 = "fastpfor256";
+
+	void		Load ( util::FileReader_c & tReader );
+	void		Save ( util::FileWriter_c & tWriter );
+	bool		Check ( util::FileReader_c & tReader, Reporter_fn & fnError );
+};
+
+
 class AttributeHeaderBuilder_c
 {
 public:
@@ -150,17 +162,12 @@ static void WriteValues_Delta_PFOR ( const util::Span_T<T> & dValues, std::vecto
 {
 	dTmpUncompressed.resize ( dValues.size() );
 	memcpy ( dTmpUncompressed.data(), dValues.data(), dValues.size()*sizeof ( dValues[0] ) );
-	util::ComputeDeltas ( dTmpUncompressed.data(), (int)dTmpUncompressed.size(), true );
-
-	T uMin = dTmpUncompressed[0];
-	dTmpUncompressed[0]=0;
 
 	assert(pCodec);
-	pCodec->Encode ( dTmpUncompressed, dTmpCompressed );
+	util::Span_T<T> tUncompressed(dTmpUncompressed);
+	pCodec->EncodeDelta ( tUncompressed, dTmpCompressed );
 
-	// write the length of encoded data
-	tWriter.Pack_uint64 ( dTmpCompressed.size()*sizeof ( dTmpCompressed[0] ) + util::ByteCodec_c::CalcPackedLen(uMin) );
-	tWriter.Pack_uint64(uMin);
+	tWriter.Pack_uint64 ( dTmpCompressed.size()*sizeof ( dTmpCompressed[0] ) );
 	tWriter.Write ( (const uint8_t*)dTmpCompressed.data(), dTmpCompressed.size()*sizeof ( dTmpCompressed[0] ) );
 }
 
