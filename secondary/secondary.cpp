@@ -87,6 +87,7 @@ public:
 	int64_t		GetCountDistinct ( const std::string & sName ) const override;
 	bool		SaveMeta ( std::string & sError ) override;
 	void		ColumnUpdated ( const char * sName ) override;
+	void		GetAttrInfo ( std::vector<IndexAttrInfo_t> & dAttrs ) const override;
 
 private:
 	Settings_t	m_tSettings;
@@ -205,6 +206,8 @@ bool SecondaryIndex_c::Setup ( const std::string & sFile, std::string & sError )
 		}
 
 		m_hAttrs.insert ( { tCol.m_sName, i } );
+		if ( !tCol.m_sJsonParentName.empty() )
+			m_hAttrs.emplace ( tCol.m_sJsonParentName, i );
 	}
 
 	m_iBlocksBase = m_tReader.GetPos();
@@ -276,13 +279,31 @@ bool SecondaryIndex_c::SaveMeta ( std::string & sError )
 	
 void SecondaryIndex_c::ColumnUpdated ( const char * sName )
 {
-	auto tIt = m_hAttrs.find ( sName );
-	if ( tIt==m_hAttrs.end() )
+	int iAttr = GetColumnId ( sName );
+	if ( iAttr==-1 )
 		return;
 		
-	ColumnInfo_t & tCol = m_dAttrs[tIt->second];
+	ColumnInfo_t & tCol = m_dAttrs[iAttr];
 	m_bUpdated |= tCol.m_bEnabled; // already disabled indexes should not cause flush
+	bool bWasUpdated = tCol.m_bEnabled;
 	tCol.m_bEnabled = false;
+
+	// need to disable all fields at this JSON attribute
+	if ( bWasUpdated && !tCol.m_sJsonParentName.empty() )
+	{
+		for ( auto & tSibling : m_dAttrs )
+		{
+			if ( tSibling.m_sJsonParentName==tCol.m_sJsonParentName )
+				tSibling.m_bEnabled = false;
+		}
+	}
+}
+
+
+void SecondaryIndex_c::GetAttrInfo ( std::vector<IndexAttrInfo_t> & dAttrs ) const
+{
+	for ( const auto & i : m_dAttrs )
+		dAttrs.push_back ( { i.m_sName, i.m_eType, i.m_bEnabled } );
 }
 
 
