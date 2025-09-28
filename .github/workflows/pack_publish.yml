@@ -110,9 +110,9 @@ jobs:
         id: set_locator
         run: |
           if [[ "${{ github.event.schedule }}" == "00 20 * * *" ]]; then
-            echo "manticore_locator=GIT_REPOSITORY https://github.com/manticoresoftware/manticoresearch.git GIT_TAG master" >> $GITHUB_OUTPUT
+            echo "manticore_locator=GIT_REPOSITORY https://github.com/manticoresoftware/manticoresearch.git GIT_TAG master GIT_SUBMODULES \"\"" >> $GITHUB_OUTPUT
           elif [[ "${{ github.ref_name }}" != "master" && "${{ steps.check_branch.outputs.branch_exists }}" == "true" ]]; then
-            echo "manticore_locator=GIT_REPOSITORY https://github.com/manticoresoftware/manticoresearch.git GIT_TAG ${{ steps.check_branch.outputs.branch_name }}" >> $GITHUB_OUTPUT
+            echo "manticore_locator=GIT_REPOSITORY https://github.com/manticoresoftware/manticoresearch.git GIT_TAG ${{ steps.check_branch.outputs.branch_name }} GIT_SUBMODULES \"\"" >> $GITHUB_OUTPUT
           else
             echo "manticore_locator=" >> $GITHUB_OUTPUT
           fi
@@ -244,6 +244,7 @@ jobs:
       embeddings_artifact: embeddings_windows_x86_64
       version: ${{ needs.pack.outputs.version }}
       package_version: ${{ needs.pack.outputs.version_full }}
+      skip_avx2_move: true
 
   # virtual job to simplify the CI
   # This job depends on all the package preparation jobs that have to pass before we can start publishing packages
