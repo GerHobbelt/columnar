@@ -208,7 +208,7 @@ void HNSWIndex_c::Search ( std::vector<DocDist_t> & dResults, const Span_T<float
 	const void * pData = dData.begin();
 	if ( m_pQuantizer )
 	{
-		m_pQuantizer->Encode ( dData, dQuantized );
+		m_pQuantizer->Encode ( 0, dData, dQuantized );
 		pData = dQuantized.data();
 	}
 
@@ -317,7 +317,7 @@ public:
 	virtual			~HNSWIndexBuilder_i() = default;
 
 	virtual void	Train ( const util::Span_T<float> & dData ) = 0;
-	virtual bool	AddDoc ( const util::Span_T<float> & dData, std::string & sError ) = 0;
+	virtual bool	AddDoc ( uint32_t uRowID, const util::Span_T<float> & dData, std::string & sError ) = 0;
 	virtual void	Save ( FileWriter_c & tWriter ) = 0;
 	virtual const AttrWithSettings_t & GetAttr() const = 0;
 	virtual const QuantizationSettings_t & GetQuantizationSettings() const = 0;
@@ -330,14 +330,14 @@ public:
 			HNSWIndexBuilder_c ( const AttrWithSettings_t & tAttr, int64_t iNumElements, ScalarQuantizer_i * pQuantizer );
 
 	void	Train ( const util::Span_T<float> & dData ) override;
-	bool	AddDoc ( const util::Span_T<float> & dData, std::string & sError ) override;
+	bool	AddDoc ( uint32_t uRowID, const util::Span_T<float> & dData, std::string & sError ) override;
 	void	Save ( FileWriter_c & tWriter ) override;
 	const AttrWithSettings_t & GetAttr() const override						{ return m_tAttr; }
 	const QuantizationSettings_t & GetQuantizationSettings() const override { return m_pQuantizer->GetSettings(); }
 
 private:
 	AttrWithSettings_t			m_tAttr;
-	uint32_t					m_tRowID = 0;
+	bool						m_bFirstDoc = true;
 	SpanResizeable_T<float>		m_dNormalized;
 	std::vector<uint8_t>		m_dQuantized;
 	std::unique_ptr<ScalarQuantizer_i>					m_pQuantizer;
@@ -362,7 +362,7 @@ void HNSWIndexBuilder_c::Train ( const util::Span_T<float> & dData )
 }
 
 
-bool HNSWIndexBuilder_c::AddDoc ( const util::Span_T<float> & dData, std::string & sError )
+bool HNSWIndexBuilder_c::AddDoc ( uint32_t uRowID, const util::Span_T<float> & dData, std::string & sError )
 {
 	if ( dData.size()!=m_tAttr.m_iDims )
 	{
@@ -380,19 +380,21 @@ bool HNSWIndexBuilder_c::AddDoc ( const util::Span_T<float> & dData, std::string
 
 	if ( m_pQuantizer )
 	{
-		if ( !m_tRowID )
+		if ( m_bFirstDoc )
 		{
+			m_bFirstDoc = false;
+
 			if ( !m_pQuantizer->FinalizeTraining(sError) )
 				return false;
 
 			m_pSpace->SetQuantizationSettings ( *m_pQuantizer );
 		}
 
-		m_pQuantizer->Encode ( dToAdd, m_dQuantized );
-		m_pAlg->addPoint ( (void*)m_dQuantized.data(), (size_t)m_tRowID++ );
+		m_pQuantizer->Encode ( uRowID, dToAdd, m_dQuantized );
+		m_pAlg->addPoint ( (void*)m_dQuantized.data(), (size_t)uRowID );
 	}
 	else
-		m_pAlg->addPoint ( (void*)dToAdd.data(), (size_t)m_tRowID++ );
+		m_pAlg->addPoint ( (void*)dToAdd.data(), (size_t)uRowID );
 
 	return true;
 }
@@ -413,8 +415,8 @@ class HNSWBuilder_c : public Builder_i
 public:
 			HNSWBuilder_c ( const Schema_t & tSchema, int64_t iNumElements, const std::string & sTmpFilename );
 
-	void	Train ( int iAttr, const util::Span_T<float> & dData ) override			{ m_dIndexes[iAttr]->Train(dData); }
-	bool	SetAttr ( int iAttr, const util::Span_T<float> & dData ) override		{ return m_dIndexes[iAttr]->AddDoc ( dData, m_sError ); }
+	void	Train ( int iAttr, uint32_t uRowID, const util::Span_T<float> & dData ) override	{ m_dIndexes[iAttr]->Train(dData); }
+	bool	SetAttr ( int iAttr, uint32_t uRowID, const util::Span_T<float> & dData ) override	{ return m_dIndexes[iAttr]->AddDoc ( uRowID, dData, m_sError ); }
 	bool	Save ( const std::string & sFilename, size_t tBufferSize, std::string & sError ) override;
 	const std::string & GetError() const override									{ return m_sError; }
 
@@ -426,8 +428,9 @@ private:
 
 HNSWBuilder_c::HNSWBuilder_c ( const Schema_t & tSchema, int64_t iNumElements, const std::string & sTmpFilename )
 {
+	int iFile = 0;
 	for ( const auto & i : tSchema )
-		m_dIndexes.push_back ( std::make_unique<HNSWIndexBuilder_c> ( i, iNumElements, CreateQuantizer ( i.m_eQuantization, i.m_eHNSWSimilarity, sTmpFilename ) ) );
+		m_dIndexes.push_back ( std::make_unique<HNSWIndexBuilder_c> ( i, iNumElements, CreateQuantizer ( i.m_eQuantization, i.m_eHNSWSimilarity, iNumElements, FormatStr ( "%s.%d", sTmpFilename.c_str(), iFile++ ) ) ) );
 }
 
 
