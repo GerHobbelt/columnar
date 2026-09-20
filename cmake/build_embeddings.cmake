@@ -40,14 +40,14 @@ function(prepare_embeddings_ort)
 		set ( _arch "x64" )
 	endif()
 
-	embeddings_ort_download ( _lib_dir "${_platform}" "${_arch}" "${CMAKE_CURRENT_BINARY_DIR}/embeddings/ort" )
+	embeddings_ort_download ( _lib_dir "${_platform}" "${_arch}" "${MANTICORE_EMBEDDINGS_DEPS_DIR}/ort" )
 
 	set ( ENV{ORT_LIB_LOCATION} "${_lib_dir}" )
 	message ( STATUS "Using ORT_LIB_LOCATION=${_lib_dir}" )
 endfunction()
 
 function(build_embeddings_lib)
-	message ( STATUS "building embeddings locally..." )
+	message ( STATUS "Configuring local embeddings build target..." )
 
 	# Set platform-specific library file names
 	if(WIN32)
@@ -75,6 +75,22 @@ function(build_embeddings_lib)
 	# This matches the format used by other Manticore libraries for consistent version display
 	set(ENV{GIT_COMMIT_ID} "${GIT_COMMIT_ID}")
 	set(ENV{GIT_TIMESTAMP_ID} "${GIT_TIMESTAMP_ID}")
+
+	if (NOT DEFINED MANTICORE_EMBEDDINGS_TARGET_DIR)
+		if (DEFINED ENV{CARGO_TARGET_DIR} AND NOT "$ENV{CARGO_TARGET_DIR}" STREQUAL "")
+			set(_embeddings_target_dir_default "$ENV{CARGO_TARGET_DIR}")
+		else()
+			set(_embeddings_target_dir_default "${columnar_SOURCE_DIR}/embeddings/target")
+		endif()
+		set(MANTICORE_EMBEDDINGS_TARGET_DIR "${_embeddings_target_dir_default}" CACHE PATH "Shared Cargo target directory for MCL embeddings")
+	endif()
+	if (NOT DEFINED MANTICORE_EMBEDDINGS_DEPS_DIR)
+		set(MANTICORE_EMBEDDINGS_DEPS_DIR "${MANTICORE_EMBEDDINGS_TARGET_DIR}/manticore-deps" CACHE PATH "Shared dependency cache directory for MCL embeddings")
+	endif()
+	file(MAKE_DIRECTORY "${MANTICORE_EMBEDDINGS_TARGET_DIR}" "${MANTICORE_EMBEDDINGS_DEPS_DIR}")
+	message ( STATUS "Using MANTICORE_EMBEDDINGS_TARGET_DIR=${MANTICORE_EMBEDDINGS_TARGET_DIR}" )
+	message ( STATUS "Using MANTICORE_EMBEDDINGS_DEPS_DIR=${MANTICORE_EMBEDDINGS_DEPS_DIR}" )
+
 	prepare_embeddings_ort()
 
 	# Enable platform-specific BLAS acceleration for candle when available.
@@ -108,27 +124,112 @@ function(build_embeddings_lib)
 		set(EMBEDDINGS_CARGO_FEATURE_ARGS "--features" "${EMBEDDINGS_FEATURES_CSV}")
 	endif()
 
-	execute_process (
-			COMMAND cargo build --manifest-path ${CMAKE_SOURCE_DIR}/embeddings/Cargo.toml --lib --release ${EMBEDDINGS_CARGO_FEATURE_ARGS} --target-dir ${CMAKE_CURRENT_BINARY_DIR}/embeddings
-			RESULT_VARIABLE CMD_RESULT
+	set(EMBEDDINGS_LIB_SRC_PATH "${MANTICORE_EMBEDDINGS_TARGET_DIR}/release/${EMBEDDINGS_LIB_FILE_SRC}")
+	set(EMBEDDINGS_LIB_DST_PATH "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_FILE_DST}")
+
+	file(GLOB_RECURSE EMBEDDINGS_RUST_SOURCES CONFIGURE_DEPENDS
+			"${columnar_SOURCE_DIR}/embeddings/*.toml"
+			"${columnar_SOURCE_DIR}/embeddings/Cargo.lock"
+			"${columnar_SOURCE_DIR}/embeddings/build.rs"
+			"${columnar_SOURCE_DIR}/embeddings/src/*.rs"
 	)
 
-	if (NOT CMD_RESULT EQUAL 0)
-		message ( FATAL_ERROR "Failed to build: ${CMD_RESULT}" )
-	endif ()
-
-	set(EMBEDDINGS_LIB_SRC_PATH "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_FILE_SRC}")
-	set(EMBEDDINGS_LIB_DST_PATH "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_FILE_DST}")
-	
-	# Check that the library file exists before attempting to rename it.
-	# This provides a clearer error message if EMBEDDINGS_LIB_NAME was not set correctly
-	# or if the cargo build produced a different filename than expected.
-	if (NOT EXISTS "${EMBEDDINGS_LIB_SRC_PATH}")
-		message ( FATAL_ERROR "Expected library file not found: ${EMBEDDINGS_LIB_SRC_PATH}" )
-	endif ()
-	
-	file(RENAME "${EMBEDDINGS_LIB_SRC_PATH}" "${EMBEDDINGS_LIB_DST_PATH}")
-	if ( EXISTS "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_NAME}.pdb" )
-		file(RENAME "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_NAME}.pdb" "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/lib_${EMBEDDINGS_LIB_NAME}.pdb")
+	set(EMBEDDINGS_VERSION_STAMP "${CMAKE_CURRENT_BINARY_DIR}/embeddings/version.stamp")
+	set(EMBEDDINGS_VERSION_STAMP_CONTENT "${GIT_COMMIT_ID}\n${GIT_TIMESTAMP_ID}\n$ENV{ORT_LIB_LOCATION}\n$ENV{MKLROOT}\n${EMBEDDINGS_FEATURES_CSV}\n${MANTICORE_EMBEDDINGS_TARGET_DIR}\n${MANTICORE_EMBEDDINGS_DEPS_DIR}\n")
+	if (EXISTS "${EMBEDDINGS_VERSION_STAMP}")
+		file(READ "${EMBEDDINGS_VERSION_STAMP}" EMBEDDINGS_CURRENT_VERSION_STAMP)
 	endif()
+	if (NOT EMBEDDINGS_CURRENT_VERSION_STAMP STREQUAL EMBEDDINGS_VERSION_STAMP_CONTENT)
+		file(WRITE "${EMBEDDINGS_VERSION_STAMP}" "${EMBEDDINGS_VERSION_STAMP_CONTENT}")
+	endif()
+
+	set(EMBEDDINGS_CARGO_ENV
+			"GIT_COMMIT_ID=${GIT_COMMIT_ID}"
+			"GIT_TIMESTAMP_ID=${GIT_TIMESTAMP_ID}"
+	)
+	# Don't forward clang-cl (ClangCL toolset) to cargo: cc-rs then fails to build
+	# ring's C sources. Actively --unset the inherited compiler variables (the env
+	# command inherits the parent environment, so skipping the append alone wouldn't
+	# remove inherited values) so cc-rs falls back to a coherent native cl.exe setup.
+	set(_embeddings_dropped_clang_cl OFF)
+	macro(_embeddings_drop_clang_cl _var _envname)
+		if (${_var} AND MSVC)
+			get_filename_component(_embeddings_cc_name "${${_var}}" NAME_WE)
+			string(TOLOWER "${_embeddings_cc_name}" _embeddings_cc_name)
+			if (_embeddings_cc_name STREQUAL "clang-cl")
+				message(STATUS "embeddings: not forwarding clang-cl as ${_envname}; letting cc-rs use MSVC cl.exe for ring's C sources")
+				set(${_var} "")
+				set(_embeddings_dropped_clang_cl ON)
+				list(APPEND EMBEDDINGS_CARGO_ENV "--unset=${_envname}")
+			endif()
+		endif()
+	endmacro()
+	set(_embeddings_cc "")
+	if (DEFINED ENV{CC})
+		set(_embeddings_cc "$ENV{CC}")
+	endif()
+	if (NOT _embeddings_cc)
+		set(_embeddings_cc "${CMAKE_C_COMPILER}")
+	endif()
+	if (NOT _embeddings_cc AND UNIX)
+		find_program(_embeddings_cc NAMES clang cc gcc)
+	endif()
+	_embeddings_drop_clang_cl(_embeddings_cc CC)
+	if (_embeddings_cc)
+		list(APPEND EMBEDDINGS_CARGO_ENV "CC=${_embeddings_cc}")
+	endif()
+	set(_embeddings_cxx "")
+	if (DEFINED ENV{CXX})
+		set(_embeddings_cxx "$ENV{CXX}")
+	endif()
+	if (NOT _embeddings_cxx)
+		set(_embeddings_cxx "${CMAKE_CXX_COMPILER}")
+	endif()
+	if (NOT _embeddings_cxx AND UNIX)
+		find_program(_embeddings_cxx NAMES clang++ c++ g++)
+	endif()
+	_embeddings_drop_clang_cl(_embeddings_cxx CXX)
+	if (_embeddings_cxx)
+		list(APPEND EMBEDDINGS_CARGO_ENV "CXX=${_embeddings_cxx}")
+	endif()
+	# When we dropped clang-cl, cc-rs builds ring's C with native cl.exe. But the
+	# ClangCL MSBuild toolset also prepended Clang's builtin-header dir to INCLUDE,
+	# and cl.exe chokes on Clang's <stddef.h> (C1012). We can't unset INCLUDE (cc-rs
+	# trusts the ambient devenv and cl.exe then finds no CRT/SDK headers -> C1083),
+	# so run cargo through a launcher that strips just the LLVM dirs from INCLUDE at
+	# build time. Empty prefix -> the command runs directly, unchanged.
+	set(_embeddings_cargo_launcher "")
+	if (_embeddings_dropped_clang_cl)
+		set(_embeddings_cargo_launcher
+				${CMAKE_COMMAND} -P "${columnar_SOURCE_DIR}/cmake/run_embeddings_cargo.cmake" --)
+	endif()
+	if (DEFINED ENV{ORT_LIB_LOCATION} AND NOT "$ENV{ORT_LIB_LOCATION}" STREQUAL "")
+		list(APPEND EMBEDDINGS_CARGO_ENV "ORT_LIB_LOCATION=$ENV{ORT_LIB_LOCATION}")
+	endif()
+	if (DEFINED ENV{MKLROOT} AND NOT "$ENV{MKLROOT}" STREQUAL "")
+		list(APPEND EMBEDDINGS_CARGO_ENV "MKLROOT=$ENV{MKLROOT}")
+	endif()
+
+	add_custom_command(
+			OUTPUT "${EMBEDDINGS_LIB_DST_PATH}"
+			COMMAND ${_embeddings_cargo_launcher} ${CMAKE_COMMAND} -E env ${EMBEDDINGS_CARGO_ENV}
+				"${CARGO_COMMAND}" build --manifest-path "${columnar_SOURCE_DIR}/embeddings/Cargo.toml" --lib --release ${EMBEDDINGS_CARGO_FEATURE_ARGS} --target-dir "${MANTICORE_EMBEDDINGS_TARGET_DIR}"
+			COMMAND ${CMAKE_COMMAND}
+				-DEMBEDDINGS_LIB_SRC_PATH=${EMBEDDINGS_LIB_SRC_PATH}
+				-DEMBEDDINGS_LIB_DST_PATH=${EMBEDDINGS_LIB_DST_PATH}
+				-DEMBEDDINGS_PDB_SRC_PATH=${MANTICORE_EMBEDDINGS_TARGET_DIR}/release/${EMBEDDINGS_LIB_NAME}.pdb
+				-DEMBEDDINGS_PDB_DST_PATH=${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/lib_${EMBEDDINGS_LIB_NAME}.pdb
+				-P "${columnar_SOURCE_DIR}/cmake/copy_embeddings_artifacts.cmake"
+			DEPENDS ${EMBEDDINGS_RUST_SOURCES} "${EMBEDDINGS_VERSION_STAMP}"
+			WORKING_DIRECTORY "${columnar_SOURCE_DIR}/embeddings"
+			COMMENT "Building manticoresearch text embeddings library"
+			VERBATIM
+	)
+
+	if (NOT TARGET manticore_knn_embeddings)
+		add_custom_target(manticore_knn_embeddings ALL DEPENDS "${EMBEDDINGS_LIB_DST_PATH}")
+	endif()
+
+	set(EMBEDDINGS_LIB "${EMBEDDINGS_LIB_DST_PATH}" PARENT_SCOPE)
+	set(MANTICORE_KNN_EMBEDDINGS_LIB "${EMBEDDINGS_LIB_DST_PATH}" CACHE INTERNAL "Path to manticoresearch text embeddings library" FORCE)
 endfunction ()

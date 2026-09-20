@@ -351,6 +351,8 @@ template<typename VEC>
 static FORCE_INLINE void DecodeBlock ( VEC & dDst, int iNumValues, IntCodec_i * pCodec, SpanResizeable_T<uint32_t> & dBuf, FileReader_c & tReader )
 {
 	ReadBlock ( dDst, iNumValues, dBuf, tReader );
+	if ( tReader.IsError() )
+		return;
 	pCodec->DecodeDelta ( dBuf, dDst );
 }
 
@@ -358,13 +360,16 @@ template<typename VEC>
 static FORCE_INLINE void DecodeBlockWoDelta ( VEC & dDst, int iNumValues, IntCodec_i * pCodec, SpanResizeable_T<uint32_t> & dBuf, FileReader_c & tReader )
 {
 	ReadBlock ( dDst, iNumValues, dBuf, tReader );
+	if ( tReader.IsError() )
+		return;
 	pCodec->Decode ( dBuf, dDst );	
 }
 
 
 static FORCE_INLINE void SkipBlockUint32 ( FileReader_c & tReader )
 {
-	SkipVectorLen32<uint32_t>(tReader);
+	if ( !tReader.IsError() )
+		SkipVectorLen32<uint32_t>(tReader);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -914,7 +919,11 @@ void BlockReader_T<VALUE, STORED_VALUE>::CreateBlocksIterator ( const std::vecto
 	std::function<void( BitmapIterator_i * pIterator )> fnDeleter = [&]( BitmapIterator_i * pIterator ){ if ( pIterator ) { assert(dRes.empty()); dRes.push_back(pIterator); } };
 	RowidRange_t * pBounds = m_bHaveBounds ? &m_tBounds : nullptr;
 	std::unique_ptr<BitmapIterator_i, decltype(fnDeleter)> pBitmapIterator ( SpawnBitmapIterator ( pBounds, tFilter.m_bExclude ), fnDeleter );
-	if ( pBitmapIterator && m_iCutoff>=0 )
+	// For excluded filters the bitmap first collects rows that must be excluded
+	// and is inverted only after all value iterators are processed. Applying the
+	// query cutoff before inversion would mark only the first N excluded rows and
+	// then let the remaining excluded rows pass after inversion.
+	if ( pBitmapIterator && m_iCutoff>=0 && !tFilter.m_bExclude )
 		pBitmapIterator->SetCutoff(m_iCutoff);
 
 	std::unique_ptr<BlockIteratorWithSetup_i> pCommonIterator;
