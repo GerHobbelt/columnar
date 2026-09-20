@@ -4,7 +4,7 @@ use crate::utils::{
     chunk_input_tokens, get_hidden_size, get_max_input_length, get_mean_vector, normalize,
 };
 use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{
     BertModel, Config as BertConfig, HiddenAct, DTYPE as BERT_DTYPE,
@@ -20,6 +20,7 @@ use candle_transformers::models::mistral::{
 use candle_transformers::models::quantized_gemma3::ModelWeights as QuantizedGemmaModel;
 use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlamaModel;
 use candle_transformers::models::qwen3::{Config as QwenConfig, Model as QwenModel, Qwen3Cache};
+use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -36,6 +37,8 @@ pub enum ModelArch {
     Bert,
     /// Causal/LM-style decoder (mean pooling)
     Causal,
+    /// T5-style encoder (CLS pooling)
+    T5,
 }
 
 impl ModelArch {
@@ -47,6 +50,8 @@ impl ModelArch {
             // Qwen, Llama, Mistral, Gemma use causal architecture
             Some("qwen2") | Some("qwen3") | Some("llama") | Some("mistral") | Some("gemma")
             | Some("gemma2") | Some("gemma3") | Some("gemma3_text") => ModelArch::Causal,
+            // T5 encoder models
+            Some("t5") => ModelArch::T5,
             // Default to BERT for everything else
             _ => ModelArch::Bert,
         }
@@ -142,6 +147,7 @@ pub fn build_model_info(
     cache_path: PathBuf,
     model_id: &str,
     revision: &str,
+    hf_token: Option<&str>,
 ) -> Result<LocalModelInfo, Box<dyn Error>> {
     let download_lock = model_download_lock(model_id);
     let _download_guard = download_lock
@@ -151,12 +157,14 @@ pub fn build_model_info(
     let _download_tracker = download_tracker_enter(model_id);
 
     let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
-    let api = ApiBuilder::new()
-        .with_cache_dir(cache_path)
+    let mut api_builder = ApiBuilder::new().with_cache_dir(cache_path);
+    if let Some(token) = hf_token {
+        api_builder = api_builder.with_token(Some(token.to_string()));
+    }
+    let api = api_builder
         .build()
         .map_err(|_| LibError::HuggingFaceApiBuildFailed)?;
     let api = api.repo(repo);
-
     let config_path = api
         .get("config.json")
         .map_err(|_| LibError::ModelConfigFetchFailed)?;
@@ -337,6 +345,54 @@ impl BertEmbeddingModel {
         Ok(Self {
             model,
             tokenizer: tokenizer.clone(),
+            max_input_len,
+            hidden_size,
+            device,
+        })
+    }
+}
+
+/// T5-style local embedding model (encoder-only)
+pub struct T5EmbeddingModel {
+    model: Arc<Mutex<T5EncoderModel>>,
+    tokenizer: Tokenizer,
+    max_input_len: usize,
+    hidden_size: usize,
+    device: Device,
+}
+
+impl T5EmbeddingModel {
+    pub fn new(model_info: LocalModelInfo, use_gpu: bool) -> Result<Self, Box<dyn Error>> {
+        let device = if use_gpu {
+            Device::new_cuda(0).map_err(|_| LibError::DeviceCudaInitFailed)?
+        } else {
+            Device::Cpu
+        };
+        let config_str = std::fs::read_to_string(&model_info.config_path)
+            .map_err(|_| LibError::ModelConfigReadFailed)?;
+        let max_input_len =
+            get_max_input_length(&config_str).map_err(|_| LibError::ModelMaxInputLenGetFailed)?;
+        let hidden_size =
+            get_hidden_size(&config_str).map_err(|_| LibError::ModelHiddenSizeGetFailed)?;
+
+        let config: T5Config =
+            serde_json::from_str(&config_str).map_err(|_| LibError::ModelConfigParseFailed)?;
+
+        let mut tokenizer = load_tokenizer(&model_info.tokenizer_path)?;
+        tokenizer.with_padding(None);
+        let _ = tokenizer.with_truncation(None);
+
+        let dtype = dtype_from_config(&config_str, &device);
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&model_info.weights_paths, dtype, &device)
+                .map_err(|_| LibError::ModelWeightsLoadFailed)?
+        };
+
+        let model = T5EncoderModel::load(vb, &config).map_err(|_| LibError::ModelLoadFailed)?;
+
+        Ok(Self {
+            model: Arc::new(Mutex::new(model)),
+            tokenizer,
             max_input_len,
             hidden_size,
             device,
@@ -606,13 +662,19 @@ impl QuantizedEmbeddingModel {
 /// Unified local embedding model
 pub enum LocalModel {
     Bert(BertEmbeddingModel),
+    T5(T5EmbeddingModel),
     Causal(CausalEmbeddingModel),
     Quantized(QuantizedEmbeddingModel),
 }
 
 impl LocalModel {
-    pub fn new(model_id: &str, cache_path: PathBuf, use_gpu: bool) -> Result<Self, Box<dyn Error>> {
-        let model_info = build_model_info(cache_path, model_id, "main")?;
+    pub fn new(
+        model_id: &str,
+        cache_path: PathBuf,
+        use_gpu: bool,
+        hf_token: Option<&str>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let model_info = build_model_info(cache_path, model_id, "main", hf_token)?;
         let config = std::fs::read_to_string(&model_info.config_path)
             .map_err(|_| LibError::ModelConfigReadFailed)?;
         let arch = ModelArch::from_config(&config);
@@ -634,6 +696,10 @@ impl LocalModel {
                 let model = BertEmbeddingModel::new(model_info, use_gpu)?;
                 Ok(LocalModel::Bert(model))
             }
+            ModelArch::T5 => {
+                let model = T5EmbeddingModel::new(model_info, use_gpu)?;
+                Ok(LocalModel::T5(model))
+            }
             ModelArch::Causal => match model_type.as_deref() {
                 Some("qwen2") | Some("qwen3") | Some("llama") | Some("mistral") | Some("gemma")
                 | Some("gemma2") | Some("gemma3") | Some("gemma3_text") => {
@@ -654,6 +720,7 @@ impl TextModel for LocalModel {
     fn predict(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
         let (device, max_input_len) = match self {
             LocalModel::Bert(m) => (m.device.clone(), m.max_input_len),
+            LocalModel::T5(m) => (m.device.clone(), m.max_input_len),
             LocalModel::Causal(m) => (m.device.clone(), m.max_input_len),
             LocalModel::Quantized(m) => (m.device.clone(), m.max_input_len),
         };
@@ -663,6 +730,12 @@ impl TextModel for LocalModel {
         for text in texts.iter() {
             let tokens = match self {
                 LocalModel::Bert(m) => m
+                    .tokenizer
+                    .encode(*text, true)
+                    .map_err(|_| LibError::ModelTokenizerEncodeFailed)?
+                    .get_ids()
+                    .to_vec(),
+                LocalModel::T5(m) => m
                     .tokenizer
                     .encode(*text, true)
                     .map_err(|_| LibError::ModelTokenizerEncodeFailed)?
@@ -696,6 +769,17 @@ impl TextModel for LocalModel {
                         let divisor = Tensor::new(seq_len as f32, &device)?;
                         let divided = summed.broadcast_div(&divisor)?;
                         divided.to_dtype(DType::F32)?
+                    }
+                    LocalModel::T5(m) => {
+                        // T5 encoder: use CLS pooling (first token)
+                        let mut model = m.model.lock().unwrap();
+                        let emb = model.forward(&token_ids)?;
+                        // emb shape: [batch, seq_len, hidden_size]
+                        // CLS pooling: take first token embedding
+                        // Keep batch dimension for consistency with other models
+                        let cls_emb = emb.i(0)?; // [seq_len, hidden_size]
+                        let first_token = cls_emb.i(0)?; // [hidden_size]
+                        first_token.unsqueeze(0)?.to_dtype(DType::F32)? // [1, hidden_size]
                     }
                     LocalModel::Causal(m) => match &m.kind {
                         CausalEmbeddingKind::Qwen { model, config } => {
@@ -791,6 +875,7 @@ impl TextModel for LocalModel {
     fn get_hidden_size(&self) -> usize {
         match self {
             LocalModel::Bert(m) => m.hidden_size,
+            LocalModel::T5(m) => m.hidden_size,
             LocalModel::Causal(m) => m.hidden_size,
             LocalModel::Quantized(m) => m.hidden_size,
         }
@@ -799,9 +884,15 @@ impl TextModel for LocalModel {
     fn get_max_input_len(&self) -> usize {
         match self {
             LocalModel::Bert(m) => m.max_input_len,
+            LocalModel::T5(m) => m.max_input_len,
             LocalModel::Causal(m) => m.max_input_len,
             LocalModel::Quantized(m) => m.max_input_len,
         }
+    }
+
+    fn validate_api_key(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Local models don't use API keys, so validation is always successful
+        Ok(())
     }
 }
 
@@ -842,6 +933,20 @@ mod tests {
     fn test_model_arch_detection_gemma3_text() {
         let gemma3_config = r#"{"model_type":"gemma3_text"}"#;
         assert_eq!(ModelArch::from_config(gemma3_config), ModelArch::Causal);
+    }
+
+    #[test]
+    fn test_model_arch_detection_t5() {
+        let t5_config = r#"{"model_type":"t5"}"#;
+        assert_eq!(ModelArch::from_config(t5_config), ModelArch::T5);
+    }
+
+    #[test]
+    fn test_model_arch_detection_frida() {
+        // FRIDA model config
+        let frida_config =
+            r#"{"architectures":["T5EncoderModel"],"model_type":"t5","d_model":1536}"#;
+        assert_eq!(ModelArch::from_config(frida_config), ModelArch::T5);
     }
 
     #[test]
