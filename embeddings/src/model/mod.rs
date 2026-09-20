@@ -36,6 +36,21 @@ pub trait TextModel {
     /// Validates the API key by making a minimal test request to the API.
     /// For remote models, this makes an actual HTTP request. For local models, this is a no-op.
     fn validate_api_key(&self) -> Result<(), Box<dyn Error>>;
+
+    /// Split one document into chunk byte spans `(start, end)` per `strategy`,
+    /// sized to `max_tokens` with `overlap` token overlap. Default impl is the
+    /// char/byte heuristic for remote API models (no local tokenizer);
+    /// `LocalModel` overrides it with token-accurate chunking via its loaded
+    /// tokenizer. Used by every strategy except `truncate`.
+    fn chunk(
+        &self,
+        text: &str,
+        max_tokens: usize,
+        overlap: usize,
+        strategy: u32,
+    ) -> Vec<(usize, usize)> {
+        crate::chunk::chunk_text(text, max_tokens, overlap, strategy, None)
+    }
 }
 
 #[repr(C)]
@@ -46,6 +61,10 @@ pub struct ModelOptions {
     pub api_url: Option<String>,
     pub api_timeout: Option<u64>, // Timeout in seconds (None means use default: 10 seconds)
     pub use_gpu: Option<bool>,
+    /// Cap on the number of tokens taken from each input text. None = the model's own
+    /// context limit (max_position_embeddings), which for long-context models is far
+    /// beyond what is practical on CPU (see manticoresearch#4816).
+    pub max_input_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +122,21 @@ impl TextModel for Model {
             Model::Voyage(m) => m.validate_api_key(),
             Model::Jina(m) => m.validate_api_key(),
             Model::Local(m) => m.validate_api_key(),
+        }
+    }
+
+    fn chunk(
+        &self,
+        text: &str,
+        max_tokens: usize,
+        overlap: usize,
+        strategy: u32,
+    ) -> Vec<(usize, usize)> {
+        match self {
+            Model::OpenAI(m) => m.chunk(text, max_tokens, overlap, strategy),
+            Model::Voyage(m) => m.chunk(text, max_tokens, overlap, strategy),
+            Model::Jina(m) => m.chunk(text, max_tokens, overlap, strategy),
+            Model::Local(m) => m.chunk(text, max_tokens, overlap, strategy),
         }
     }
 }
@@ -198,6 +232,7 @@ pub fn create_model(options: ModelOptions) -> Result<Model, Box<dyn Error>> {
             cache_path,
             options.use_gpu.unwrap_or(false),
             hf_token,
+            options.max_input_tokens,
         )?;
 
         Ok(Model::Local(Box::new(model)))

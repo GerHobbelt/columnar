@@ -41,6 +41,7 @@ mod tests {
             api_url.as_bytes().len(),
             0, // Use default timeout
             false,
+            0, // max_input_tokens: model's own limit
         );
 
         // Should fail due to empty API key (basic validation)
@@ -82,6 +83,7 @@ mod tests {
                 api_url_c.as_bytes().len(),
                 0, // Use default timeout
                 false,
+                0, // max_input_tokens: model's own limit
             );
 
             // All should fail and have proper error messages
@@ -152,6 +154,9 @@ mod tests {
             ptr: ptr::null(),
             len: 0,
             cap: 0,
+            row_offsets: ptr::null(),
+            rows: 0,
+            offsets_cap: 0,
         };
 
         // Verify error is set and no vectors are present
@@ -194,6 +199,9 @@ mod tests {
             ptr: float_vecs.as_ptr(),
             len: float_vecs.len(),
             cap: float_vecs.capacity(),
+            row_offsets: ptr::null(),
+            rows: 0,
+            offsets_cap: 0,
         };
 
         // Verify successful result structure
@@ -241,6 +249,7 @@ mod tests {
                 api_url.as_bytes().len(),
                 0, // Use default timeout
                 false,
+                0, // max_input_tokens: model's own limit
             );
 
             // Should fail due to empty API key (basic validation)
@@ -316,6 +325,7 @@ mod tests {
                 api_url.as_bytes().len(),
                 0, // Use default timeout
                 false,
+                0, // max_input_tokens: model's own limit
             );
 
             if should_be_valid {
@@ -406,6 +416,7 @@ mod tests {
                 api_url.as_bytes().len(),
                 0, // Use default timeout
                 false,
+                0, // max_input_tokens: model's own limit
             );
 
             if should_be_valid && model_id.starts_with("openai/") {
@@ -469,6 +480,7 @@ mod tests {
                         api_url.as_bytes().len(),
                         0, // Use default timeout
                         false,
+                        0, // max_input_tokens: model's own limit
                     );
 
                     // Should fail with invalid API key

@@ -22,6 +22,7 @@
 
 #include <unordered_map>
 #include <algorithm>
+#include <mutex>
 
 #ifdef WIN32
 	#define WIN32_LEAN_AND_MEAN
@@ -72,6 +73,8 @@ bool LoadFunc ( T & pFunc, void * pHandle, const char * szFunc, const std::strin
 
 using GetLibFuncs_fn = const EmbedLib * (*)();
 
+using ModelRef_t = std::shared_ptr<void>;
+
 class LoadedLib_c
 {
 public:
@@ -80,14 +83,17 @@ public:
 
 	bool				Initialize ( std::string & sError );
 
-	void				AddModel ( const std::string & sKey, TextModelWrapper pModel ) { m_hModels.insert ( { sKey, pModel } ); }
-	TextModelWrapper	GetModel ( const std::string & sKey ) const;
+	ModelRef_t			AcquireModel ( const std::string & sKey );
+	ModelRef_t			AddModel ( const std::string & sKey, TextModelWrapper pModel );
 	const EmbedLib *	GetLibFuncs() const { return m_pLibFuncs; }
 
 private:
+	void				FreeModel ( TextModelWrapper pModel );
+
 	std::string			m_sLibPath;
 	void *				m_pHandle = nullptr;
-	std::unordered_map<std::string, TextModelWrapper> m_hModels;
+	std::mutex			m_tModelsMutex;
+	std::unordered_map<std::string, std::weak_ptr<void>> m_hModels;
 	const EmbedLib *	m_pLibFuncs = nullptr;
 };
 
@@ -121,21 +127,52 @@ LoadedLib_c::~LoadedLib_c()
 	if ( !m_pHandle )
 		return;
 
-	if ( m_pLibFuncs )
-		for ( auto i : m_hModels )
-		{
-			TextModelResult	tResult = { i.second };
-			m_pLibFuncs->free_model_result(tResult);
-		}
-
 	dlclose(m_pHandle);
 }
 
 
-TextModelWrapper LoadedLib_c::GetModel ( const std::string & sKey ) const
+ModelRef_t LoadedLib_c::AcquireModel ( const std::string & sKey )
 {
+	std::lock_guard<std::mutex> tLock(m_tModelsMutex);
 	const auto & tFound = m_hModels.find(sKey);
-	return tFound==m_hModels.end() ? nullptr : tFound->second;
+	if ( tFound==m_hModels.end() )
+		return {};
+
+	auto pModel = tFound->second.lock();
+	if ( !pModel )
+		m_hModels.erase(tFound);
+
+	return pModel;
+}
+
+
+ModelRef_t LoadedLib_c::AddModel ( const std::string & sKey, TextModelWrapper pModel )
+{
+	ModelRef_t pNewModel ( pModel, [this] ( void * pValue ) { FreeModel(pValue); } );
+
+	ModelRef_t pExistingModel;
+	{
+		std::lock_guard<std::mutex> tLock(m_tModelsMutex);
+		auto & pCachedModel = m_hModels[sKey];
+		pExistingModel = pCachedModel.lock();
+		if ( !pExistingModel )
+		{
+			pCachedModel = pNewModel;
+			return pNewModel;
+		}
+	}
+
+	return pExistingModel;
+}
+
+
+void LoadedLib_c::FreeModel ( TextModelWrapper pModel )
+{
+	if ( !pModel || !m_pLibFuncs )
+		return;
+
+	TextModelResult tResult = { pModel };
+	m_pLibFuncs->free_model_result(tResult);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -175,15 +212,24 @@ bool EmbeddingsLib_c::Load ( std::string & sError )
 
 ///////////////////////////////////////////////////////////////////////////////
 
+static void AddKeyPart ( std::string & sKey, const std::string & sValue )
+{
+	sKey += std::to_string ( sValue.length() );
+	sKey += ':';
+	sKey += sValue;
+}
+
+
 std::string ToKey ( const ModelSettings_t & tSettings )
 {
 	std::string sKey;
-	sKey += tSettings.m_sModelName;
-	sKey += tSettings.m_sCachePath;
-	sKey += tSettings.m_sAPIKey;
-	sKey += tSettings.m_sAPIUrl;
-	sKey += std::to_string ( tSettings.m_iAPITimeout );
-	sKey += std::to_string ( tSettings.m_bUseGPU ? 1 : 0 );
+	AddKeyPart ( sKey, tSettings.m_sModelName );
+	AddKeyPart ( sKey, tSettings.m_sCachePath );
+	AddKeyPart ( sKey, tSettings.m_sAPIKey );
+	AddKeyPart ( sKey, tSettings.m_sAPIUrl );
+	AddKeyPart ( sKey, std::to_string ( tSettings.m_iAPITimeout ) );
+	AddKeyPart ( sKey, std::to_string ( tSettings.m_bUseGPU ? 1 : 0 ) );
+	AddKeyPart ( sKey, std::to_string ( tSettings.m_iMaxInputTokens ) );
 	return sKey;
 }
 
@@ -195,12 +241,13 @@ public:
 			TextToEmbeddings_c ( const ModelSettings_t & tSettings ) : m_tSettings ( tSettings ) {}
 
 	bool	Initialize ( std::shared_ptr<LoadedLib_c> pLib, std::string & sError );
-	bool	Convert ( const std::vector<std::string_view> & dTexts, std::vector<std::vector<float>> & dEmbeddings, std::string & sError, int iThreads = 0 ) const override;
+	bool	Convert ( const std::vector<std::string_view> & dTexts, std::vector<std::vector<float>> & dEmbeddings, std::string & sError, int iThreads = 0, const knn::ChunkSettings_t * pChunk = nullptr, std::vector<size_t> * pRowOffsets = nullptr ) const override;
 	int		GetDims() const override;
 
 private:
 	ModelSettings_t		m_tSettings;
 	std::shared_ptr<LoadedLib_c> m_pLib;
+	ModelRef_t			m_pModelRef;
 	TextModelWrapper	m_pModel = nullptr;
 };
 
@@ -210,14 +257,16 @@ bool TextToEmbeddings_c::Initialize ( std::shared_ptr<LoadedLib_c> pLib, std::st
 	assert ( !m_pModel && pLib );
 
 	m_pLib = pLib;
-	m_pModel = m_pLib->GetModel ( ToKey(m_tSettings) );
+	const std::string sKey = ToKey(m_tSettings);
+	m_pModelRef = m_pLib->AcquireModel(sKey);
+	m_pModel = m_pModelRef.get();
 	if ( m_pModel )
 		return true;
 
 	auto * pFuncs = m_pLib->GetLibFuncs();
 	assert(pFuncs);
 	
-	TextModelResult tResult = pFuncs->load_model ( m_tSettings.m_sModelName.c_str(), m_tSettings.m_sModelName.length(), m_tSettings.m_sCachePath.c_str(), m_tSettings.m_sCachePath.length(), m_tSettings.m_sAPIKey.c_str(), m_tSettings.m_sAPIKey.length(), m_tSettings.m_sAPIUrl.c_str(), m_tSettings.m_sAPIUrl.length(), m_tSettings.m_iAPITimeout, m_tSettings.m_bUseGPU );
+	TextModelResult tResult = pFuncs->load_model ( m_tSettings.m_sModelName.c_str(), m_tSettings.m_sModelName.length(), m_tSettings.m_sCachePath.c_str(), m_tSettings.m_sCachePath.length(), m_tSettings.m_sAPIKey.c_str(), m_tSettings.m_sAPIKey.length(), m_tSettings.m_sAPIUrl.c_str(), m_tSettings.m_sAPIUrl.length(), m_tSettings.m_iAPITimeout, m_tSettings.m_bUseGPU, m_tSettings.m_iMaxInputTokens );
 	if ( tResult.m_szError )
 	{
 		sError = tResult.m_szError;
@@ -249,13 +298,13 @@ bool TextToEmbeddings_c::Initialize ( std::shared_ptr<LoadedLib_c> pLib, std::st
 		}
 	}
 
-	m_pModel = tResult.m_pModel;
-	m_pLib->AddModel ( ToKey(m_tSettings), m_pModel );
+	m_pModelRef = m_pLib->AddModel ( sKey, tResult.m_pModel );
+	m_pModel = m_pModelRef.get();
 	return true;
 }
 
 
-bool TextToEmbeddings_c::Convert ( const std::vector<std::string_view> & dTexts, std::vector<std::vector<float>> & dEmbeddings, std::string & sError, int iThreads ) const
+bool TextToEmbeddings_c::Convert ( const std::vector<std::string_view> & dTexts, std::vector<std::vector<float>> & dEmbeddings, std::string & sError, int iThreads, const knn::ChunkSettings_t * pChunk, std::vector<size_t> * pRowOffsets ) const
 {
 	std::vector<StringItem> dStringItems;
 	for ( const auto & i : dTexts )
@@ -264,8 +313,18 @@ bool TextToEmbeddings_c::Convert ( const std::vector<std::string_view> & dTexts,
 	auto * pFuncs = m_pLib->GetLibFuncs();
 	assert(pFuncs);
 
+	ChunkSettings tChunk;
+	if ( pChunk )
+	{
+		tChunk.strategy			= (uint32_t)pChunk->m_eStrategy;
+		tChunk.max_tokens		= pChunk->m_uMaxTokens;
+		tChunk.overlap_tokens	= pChunk->m_uOverlapTokens;
+		tChunk.max_chunks		= pChunk->m_uMaxChunks;
+	}
+
 	// iThreads: 0 = use all available CPUs (default), >0 = cap worker count in the embeddings lib
-	FloatVecResult tVecResult = pFuncs->make_vect_embeddings ( &m_pModel, dStringItems.data(), dStringItems.size(), iThreads );
+	// nullptr ChunkSettings = truncate strategy, i.e. one vector per input text
+	FloatVecResult tVecResult = pFuncs->make_vect_embeddings ( &m_pModel, dStringItems.data(), dStringItems.size(), pChunk ? &tChunk : nullptr, iThreads );
 	if ( tVecResult.m_szError )
 	{
 		sError = tVecResult.m_szError;
@@ -279,6 +338,20 @@ bool TextToEmbeddings_c::Convert ( const std::vector<std::string_view> & dTexts,
 		const FloatVec & tVec = tVecResult.m_tEmbedding[i];
 		dEmbeddings[i].resize ( tVec.len );
 		memcpy ( dEmbeddings[i].data(), tVec.ptr, sizeof(float)*tVec.len );
+	}
+
+	if ( pRowOffsets )
+	{
+		if ( !tVecResult.m_pRowOffsets || tVecResult.rows!=dTexts.size() )
+		{
+			sError = util::FormatStr ( "embeddings library returned a malformed result: %lld rows for %lld input texts%s", (long long)tVecResult.rows, (long long)dTexts.size(), tVecResult.m_pRowOffsets ? "" : ", no row offsets" );
+			pFuncs->free_vec_result(tVecResult);
+			return false;
+		}
+
+		pRowOffsets->resize ( tVecResult.rows+1 );
+		for ( size_t i = 0; i <= tVecResult.rows; i++ )
+			(*pRowOffsets)[i] = (size_t)tVecResult.m_pRowOffsets[i];
 	}
 
 	pFuncs->free_vec_result(tVecResult);
@@ -312,7 +385,7 @@ knn::EmbeddingsLib_i * LoadEmbeddingsLib ( const std::string & sLibPath, std::st
 	if ( !pLib->Load(sError) )
 		return nullptr;
 
-	const int SUPPORTED_EMBEDDINGS_LIB_VER = 4;
+	const int SUPPORTED_EMBEDDINGS_LIB_VER = 9;
 	if ( pLib->GetVersion()!=SUPPORTED_EMBEDDINGS_LIB_VER )
 	{
 		sError = util::FormatStr ( "Unsupported embeddings library version %d (expected %d)", pLib->GetVersion(), SUPPORTED_EMBEDDINGS_LIB_VER );

@@ -548,7 +548,11 @@ impl BertEmbeddingModel {
 
     /// Batched forward pass for multiple token sequences.
     /// Groups chunks into batches, pads to uniform length, runs one forward per batch.
-    fn predict_chunks(&self, chunks: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+    fn predict_chunks(
+        &self,
+        model: &BertModel,
+        chunks: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
         let mut all_embeddings = Vec::with_capacity(chunks.len());
 
         for batch in chunks.chunks(batch_size()) {
@@ -559,10 +563,7 @@ impl BertEmbeddingModel {
                 let chunk = &batch[0];
                 let token_ids = Tensor::new(chunk.as_slice(), &self.device)?.unsqueeze(0)?;
                 let token_type_ids = token_ids.zeros_like()?;
-                let emb = {
-                    let model = self.model.lock().unwrap();
-                    model.forward(&token_ids, &token_type_ids, None)?
-                };
+                let emb = model.forward(&token_ids, &token_type_ids, None)?;
                 let seq_len = token_ids.dims()[1];
                 let summed = emb.sum(1)?.to_dtype(DType::F32)?;
                 let divisor = Tensor::new(seq_len as f32, &self.device)?;
@@ -592,10 +593,7 @@ impl BertEmbeddingModel {
                 Tensor::from_vec(flat_mask.clone(), (batch_size, max_len), &self.device)?;
             let token_type_ids = token_ids.zeros_like()?;
 
-            let emb = {
-                let model = self.model.lock().unwrap();
-                model.forward(&token_ids, &token_type_ids, Some(&attention_mask))?
-            };
+            let emb = model.forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
             // emb: [batch_size, max_len, hidden_size]
 
             // Attention-mask-aware mean pooling: sum(emb * mask) / sum(mask)
@@ -1177,7 +1175,38 @@ pub enum LocalModel {
 }
 
 impl LocalModel {
+    /// Loads a local model. `max_input_tokens` caps the tokens taken from each input
+    /// text; `None` keeps the model's own limit. The cap can only lower the limit.
     pub fn new(
+        model_id: &str,
+        cache_path: PathBuf,
+        use_gpu: bool,
+        hf_token: Option<&str>,
+        max_input_tokens: Option<usize>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut model = Self::new_uncapped(model_id, cache_path, use_gpu, hf_token)?;
+        if let Some(cap) = max_input_tokens {
+            model.cap_max_input_len(cap);
+        }
+        Ok(model)
+    }
+
+    /// Lowers `max_input_len` of the loaded architecture to `cap` (never raises it).
+    /// All predict paths truncate on that field, so the cap applies everywhere.
+    fn cap_max_input_len(&mut self, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        match self {
+            LocalModel::Bert(m) => m.max_input_len = m.max_input_len.min(cap),
+            LocalModel::T5(m) => m.max_input_len = m.max_input_len.min(cap),
+            LocalModel::Causal(m) => m.max_input_len = m.max_input_len.min(cap),
+            LocalModel::Quantized(m) => m.max_input_len = m.max_input_len.min(cap),
+            LocalModel::Onnx(m) => m.max_input_len = m.max_input_len.min(cap),
+        }
+    }
+
+    fn new_uncapped(
         model_id: &str,
         cache_path: PathBuf,
         use_gpu: bool,
@@ -1285,12 +1314,32 @@ impl LocalModel {
     }
 }
 
+/// Mutex-guarded model state, locked by `predict` on the caller thread before the
+/// rayon pool is entered. Locking inside the pool can deadlock it: the worker that
+/// parks on the mutex may be holding a stolen piece of the lock owner's forward,
+/// which then never completes (manticoresearch#4915). Causal models keep no
+/// shared mutable state.
+enum Locked<'a> {
+    Bert(&'a BertModel),
+    T5(&'a mut T5EncoderModel),
+    Causal,
+    QuantizedGemma(&'a mut QuantizedGemmaModel),
+    QuantizedLlama(&'a mut QuantizedLlamaModel),
+}
+
 impl LocalModel {
     /// Inner predict body for non-ONNX local models (BERT / T5 / Causal / Quantized).
     /// Pulled out of the trait impl so the caller can wrap it in a scoped rayon pool.
-    fn predict_local(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+    fn predict_local(
+        &self,
+        mut locked: Locked<'_>,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
         // BERT: batched path (batch_size up to batch_size() per forward pass)
         if let LocalModel::Bert(m) = self {
+            let Locked::Bert(model) = locked else {
+                unreachable!()
+            };
             // Dedicated single-text bypass: SELECT KNN(field, k, 'text') hits this
             // path on every query. Skip all batching wrappers, intermediate Vecs,
             // and the chunks.chunks() loop — go straight encode → forward → pool.
@@ -1305,10 +1354,7 @@ impl LocalModel {
 
                 let token_ids = Tensor::new(ids, &m.device)?.unsqueeze(0)?;
                 let token_type_ids = token_ids.zeros_like()?;
-                let emb = {
-                    let model = m.model.lock().unwrap();
-                    model.forward(&token_ids, &token_type_ids, None)?
-                };
+                let emb = model.forward(&token_ids, &token_type_ids, None)?;
                 let seq_len = token_ids.dims()[1];
                 let summed = emb.sum(1)?.to_dtype(DType::F32)?;
                 let divisor = Tensor::new(seq_len as f32, &m.device)?;
@@ -1319,7 +1365,7 @@ impl LocalModel {
             }
 
             return Self::predict_batched(&m.tokenizer, m.max_input_len, texts, |chunks| {
-                m.predict_chunks(chunks)
+                m.predict_chunks(model, chunks)
             });
         }
 
@@ -1362,15 +1408,14 @@ impl LocalModel {
 
             {
                 let token_ids = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
-                let embeddings = match self {
-                    LocalModel::T5(m) => {
-                        let mut model = m.model.lock().unwrap();
+                let embeddings = match (self, &mut locked) {
+                    (_, Locked::T5(model)) => {
                         let emb = model.forward(&token_ids)?;
                         let cls_emb = emb.i(0)?;
                         let first_token = cls_emb.i(0)?;
                         first_token.unsqueeze(0)?.to_dtype(DType::F32)?
                     }
-                    LocalModel::Causal(m) => match &m.kind {
+                    (LocalModel::Causal(m), Locked::Causal) => match &m.kind {
                         CausalEmbeddingKind::Qwen { model, config } => qwen_mean_pool(
                             model,
                             config,
@@ -1409,24 +1454,20 @@ impl LocalModel {
                             summed.broadcast_div(&divisor)?
                         }
                     },
-                    LocalModel::Quantized(m) => match &m.model {
-                        QuantizedModelKind::Gemma { model } => {
-                            let mut model = model.lock().unwrap();
-                            let emb = model.forward(&token_ids, 0)?;
-                            let (_, n_tokens, _) = emb.dims3()?;
-                            let summed = emb.sum(1)?.to_dtype(DType::F32)?;
-                            let divisor = Tensor::new(n_tokens as f32, &device)?;
-                            summed.broadcast_div(&divisor)?
-                        }
-                        QuantizedModelKind::Llama { model } => {
-                            let mut model = model.lock().unwrap();
-                            let emb = model.forward(&token_ids, 0)?;
-                            let (_, n_tokens, _) = emb.dims3()?;
-                            let summed = emb.sum(1)?.to_dtype(DType::F32)?;
-                            let divisor = Tensor::new(n_tokens as f32, &device)?;
-                            summed.broadcast_div(&divisor)?
-                        }
-                    },
+                    (_, Locked::QuantizedGemma(model)) => {
+                        let emb = model.forward(&token_ids, 0)?;
+                        let (_, n_tokens, _) = emb.dims3()?;
+                        let summed = emb.sum(1)?.to_dtype(DType::F32)?;
+                        let divisor = Tensor::new(n_tokens as f32, &device)?;
+                        summed.broadcast_div(&divisor)?
+                    }
+                    (_, Locked::QuantizedLlama(model)) => {
+                        let emb = model.forward(&token_ids, 0)?;
+                        let (_, n_tokens, _) = emb.dims3()?;
+                        let summed = emb.sum(1)?.to_dtype(DType::F32)?;
+                        let divisor = Tensor::new(n_tokens as f32, &device)?;
+                        summed.broadcast_div(&divisor)?
+                    }
                     _ => unreachable!(),
                 };
 
@@ -1451,16 +1492,53 @@ impl LocalModel {
     }
 }
 
+impl LocalModel {
+    /// Borrow the loaded tokenizer for token-accurate document chunking.
+    fn tokenizer(&self) -> &Tokenizer {
+        match self {
+            LocalModel::Bert(m) => &m.tokenizer,
+            LocalModel::T5(m) => &m.tokenizer,
+            LocalModel::Causal(m) => &m.tokenizer,
+            LocalModel::Quantized(m) => &m.tokenizer,
+            LocalModel::Onnx(m) => &m.tokenizer,
+        }
+    }
+}
+
 impl TextModel for LocalModel {
     fn predict(&self, texts: &[&str], threads: usize) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
-        // ONNX manages its own worker count internally — no rayon pool involved.
-        if let LocalModel::Onnx(m) = self {
-            return m.predict_pipelined(texts, threads);
-        }
-
         // BERT / T5 / Causal / Quantized go through candle, which uses rayon for
-        // intra-op parallelism. Scope the rayon pool so threads > 0 caps the worker count.
-        with_thread_limit(threads, || self.predict_local(texts))
+        // intra-op parallelism. Scope the rayon pool so threads > 0 caps the worker
+        // count. Model mutexes are taken here, on the caller thread — see `Locked`.
+        match self {
+            // ONNX manages its own worker count internally — no rayon pool involved.
+            LocalModel::Onnx(m) => m.predict_pipelined(texts, threads),
+            LocalModel::Bert(m) => {
+                let model = m.model.lock().unwrap();
+                let locked = Locked::Bert(&model);
+                with_thread_limit(threads, move || self.predict_local(locked, texts))
+            }
+            LocalModel::T5(m) => {
+                let mut model = m.model.lock().unwrap();
+                let locked = Locked::T5(&mut model);
+                with_thread_limit(threads, move || self.predict_local(locked, texts))
+            }
+            LocalModel::Causal(_) => {
+                with_thread_limit(threads, || self.predict_local(Locked::Causal, texts))
+            }
+            LocalModel::Quantized(m) => match &m.model {
+                QuantizedModelKind::Gemma { model } => {
+                    let mut model = model.lock().unwrap();
+                    let locked = Locked::QuantizedGemma(&mut model);
+                    with_thread_limit(threads, move || self.predict_local(locked, texts))
+                }
+                QuantizedModelKind::Llama { model } => {
+                    let mut model = model.lock().unwrap();
+                    let locked = Locked::QuantizedLlama(&mut model);
+                    with_thread_limit(threads, move || self.predict_local(locked, texts))
+                }
+            },
+        }
     }
 
     fn get_hidden_size(&self) -> usize {
@@ -1486,6 +1564,18 @@ impl TextModel for LocalModel {
     fn validate_api_key(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Local models don't use API keys, so validation is always successful
         Ok(())
+    }
+
+    fn chunk(
+        &self,
+        text: &str,
+        max_tokens: usize,
+        overlap: usize,
+        strategy: u32,
+    ) -> Vec<(usize, usize)> {
+        // Token-accurate split via the loaded tokenizer; chunk_text picks the
+        // split method (fixed/recursive/sentence) from the strategy.
+        crate::chunk::chunk_text(text, max_tokens, overlap, strategy, Some(self.tokenizer()))
     }
 }
 
@@ -1709,7 +1799,7 @@ mod tests {
 
         let cache_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".cache/manticore");
         let local_model =
-            LocalModel::new("Qwen/Qwen3-Embedding-0.6B", cache_path, false, None).unwrap();
+            LocalModel::new("Qwen/Qwen3-Embedding-0.6B", cache_path, false, None, None).unwrap();
         let source = "Qwen chunk boundary compatibility sentence. ".repeat(20);
         local_model.predict(&[source.as_str()], 0).unwrap();
         let LocalModel::Causal(causal) = local_model else {
