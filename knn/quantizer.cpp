@@ -50,7 +50,8 @@ public:
 
 	void	Train ( const Span_T<float> & dPoint ) override;
 	bool	FinalizeTraining ( std::string & sError ) override;
-	void	Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized ) override;
+	bool	IsFinalized() const override { return m_bFinalized; }
+	void	Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized, std::vector<uint8_t> & dQuantizedForQuery ) override;
 	void	FinalizeEncoding() override {}
 	const QuantizationSettings_t & GetSettings() override;
 	std::function<const uint8_t * (uint32_t)> GetPoolFetcher() const override { return nullptr; }
@@ -138,7 +139,7 @@ bool ScalarQuantizer8Bit_c::FinalizeTraining ( std::string & sError )
 }
 
 
-void ScalarQuantizer8Bit_c::Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized )
+void ScalarQuantizer8Bit_c::Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized, std::vector<uint8_t> & /*dQuantizedForQuery*/ )
 {
 	assert(m_bFinalized);
 
@@ -183,11 +184,11 @@ class ScalarQuantizer1Bit_c : public ScalarQuantizer8Bit_c
 	using ScalarQuantizer8Bit_c::ScalarQuantizer8Bit_c;
 
 public:
-	void	Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized ) override;
+	void	Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized, std::vector<uint8_t> & dQuantizedForQuery ) override;
 };
 
 
-void ScalarQuantizer1Bit_c::Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized )
+void ScalarQuantizer1Bit_c::Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized, std::vector<uint8_t> & /*dQuantizedForQuery*/ )
 {
 	assert(m_bFinalized);
 
@@ -316,17 +317,18 @@ int BinaryQuantizer_c::Quantize ( const Span_T<float> & dVector, float fMin, flo
 	size_t uLimit = dVector.size() & ~7;
 	for ( ; i < uLimit; i += 8 )
 	{
-		__m256 iVec = _mm256_loadu_ps ( &dVector[i] );
-		iVec = _mm256_sub_ps ( iVec, iMinVec );
-		iVec = _mm256_mul_ps ( iVec, iDivVec );
-		iVec = _mm256_round_ps ( iVec, _MM_FROUND_TO_NEAREST_INT );
-		iVec = _mm256_cvtps_epi32(iVec);       
+		__m256 fVec = _mm256_loadu_ps ( &dVector[i] );
+		fVec = _mm256_sub_ps ( fVec, iMinVec );
+		fVec = _mm256_mul_ps ( fVec, iDivVec );
+		fVec = _mm256_round_ps ( fVec, _MM_FROUND_TO_NEAREST_INT );
+
+		__m256i iVec = _mm256_cvtps_epi32 ( fVec );
 		iVec = _mm256_max_epi32 ( iVec, _mm256_setzero_si256() );
 		iVec = _mm256_min_epi32 ( iVec, _mm256_set1_epi32(15) );
 
 		iSumVec = _mm256_add_epi32 ( iSumVec, iVec );
 
-		__m128i iLow = _mm256_castsi256_si128(iVec);
+		__m128i iLow = _mm256_castsi256_si128 ( iVec );
 		__m128i iHigh = _mm256_extracti128_si256 ( iVec, 1 );
 		__m128i iPack16 = _mm_packs_epi32 ( iLow, iHigh );
 		__m128i iPack8 = _mm_packus_epi16 ( iPack16, iPack16 );
@@ -647,7 +649,8 @@ public:
 
 	void	Train ( const Span_T<float> & dPoint ) override;
 	bool	FinalizeTraining ( std::string & sError ) override;
-	void	Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized ) override;
+	bool	IsFinalized() const override { return m_bFinalized; }
+	void	Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized, std::vector<uint8_t> & dQuantizedForQuery ) override;
 	void	FinalizeEncoding() override;
 	const QuantizationSettings_t & GetSettings() override;
 
@@ -659,7 +662,6 @@ private:
 	HNSWSimilarity_e		m_eSimilarity = HNSWSimilarity_e::COSINE;
 	std::string				m_sTmpFilename;
 	std::vector<double>		m_dCentroid64;
-	std::vector<uint8_t>	m_dQuantizedForQuery;
 	MappedBuffer_T<uint8_t>	m_tBuffer4Bit;
 	size_t		m_uDim = 0;
 	bool		m_bFinalized = false;
@@ -708,16 +710,17 @@ void ScalarQuantizerBinary_T<BUILD>::Train ( const Span_T<float> & dPoint )
 }
 
 template <bool BUILD>
-void ScalarQuantizerBinary_T<BUILD>::Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized )
+void ScalarQuantizerBinary_T<BUILD>::Encode ( uint32_t uRowID, const Span_T<float> & dPoint, std::vector<uint8_t> & dQuantized, std::vector<uint8_t> & dQuantizedForQuery )
 {
 	assert(m_bFinalized);
 
-	m_pQuantizer->Quantize4Bit ( dPoint, m_tSettings.m_dCentroid, BUILD ? m_dQuantizedForQuery : dQuantized );
+	m_pQuantizer->Quantize4Bit ( dPoint, m_tSettings.m_dCentroid, BUILD ? dQuantizedForQuery : dQuantized );
 	if constexpr ( !BUILD )
 		return;
 
-	int64_t iOffset = (int64_t)uRowID * m_dQuantizedForQuery.size();
-	memcpy ( m_tBuffer4Bit.data() + iOffset, m_dQuantizedForQuery.data(), m_dQuantizedForQuery.size() );
+	assert ( dQuantizedForQuery.size() == m_uQuantized4BitEntrySize );
+	int64_t iOffset = (int64_t)uRowID * dQuantizedForQuery.size();
+	memcpy ( m_tBuffer4Bit.data() + iOffset, dQuantizedForQuery.data(), dQuantizedForQuery.size() );
 
 	m_pQuantizer->Quantize1Bit ( dPoint, m_tSettings.m_dCentroid, dQuantized );
 }
@@ -766,20 +769,30 @@ bool ScalarQuantizerBinary_T<BUILD>::FinalizeTraining ( std::string & sError )
 	if ( m_bFinalized )
 		return true;
 
-	m_bFinalized = true;
-
 	if ( !m_uTrainedVecs )
+	{
+		m_bFinalized = true;
 		return true;
+	}
 
-	for ( auto & i : m_dCentroid64 )
-		m_tSettings.m_dCentroid.push_back ( i/m_uTrainedVecs );
+	if ( m_tSettings.m_dCentroid.empty() )
+	{
+		m_tSettings.m_dCentroid.reserve ( m_dCentroid64.size() );
+		for ( auto & i : m_dCentroid64 )
+			m_tSettings.m_dCentroid.push_back ( i/m_uTrainedVecs );
+	}
 
-	m_pQuantizer = std::make_unique<BinaryQuantizer_c> ( m_uDim, m_eSimilarity );
+	if ( !m_pQuantizer )
+		m_pQuantizer = std::make_unique<BinaryQuantizer_c> ( m_uDim, m_eSimilarity );
 
-	// quantize a fake vector to get quantized size
-	std::vector<float> dTmp ( m_uDim, 0.0f );
-	m_pQuantizer->Quantize4Bit ( dTmp, m_tSettings.m_dCentroid, m_dQuantizedForQuery );
-	m_uQuantized4BitEntrySize = m_dQuantizedForQuery.size();
+	if ( !m_uQuantized4BitEntrySize )
+	{
+		// quantize a fake vector to get quantized size
+		std::vector<float> dTmp ( m_uDim, 0.0f );
+		std::vector<uint8_t> dSizeProbe;
+		m_pQuantizer->Quantize4Bit ( dTmp, m_tSettings.m_dCentroid, dSizeProbe );
+		m_uQuantized4BitEntrySize = dSizeProbe.size();
+	}
 
 	FILE * pFile = fopen ( m_sTmpFilename.c_str(), "wb" );
 	if ( !pFile )
@@ -793,7 +806,11 @@ bool ScalarQuantizerBinary_T<BUILD>::FinalizeTraining ( std::string & sError )
 	fwrite ( "", 1, 1, pFile );
 	fclose ( pFile );
 
-	return m_tBuffer4Bit.Open ( m_sTmpFilename.c_str(), true, sError );
+	if ( !m_tBuffer4Bit.Open ( m_sTmpFilename.c_str(), true, sError ) )
+		return false;
+
+	m_bFinalized = true;
+	return true;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
